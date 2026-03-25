@@ -22,6 +22,12 @@ use crate::{
 pub const APP_NAME: &str = "Reminder";
 
 pub const CJK_FONT_NAME: &str = "CJK_Fallback_Font";
+const ACCOUNTS_PANEL_MIN_WIDTH: f32 = 140.0;
+const ACCOUNTS_PANEL_MAX_WIDTH: f32 = 240.0;
+const ACCOUNTS_PANEL_WIDTH_RATIO: f32 = 0.24;
+const COMPACT_ACCOUNT_ROW_WIDTH: f32 = 180.0;
+const STACKED_ACCOUNT_HEADER_WIDTH: f32 = 620.0;
+const COMPACT_NOTIFICATION_WIDTH: f32 = 640.0;
 
 #[cfg(target_os = "macos")]
 const SYSTEM_FONT_CANDIDATES: &[&str] = &[
@@ -51,6 +57,7 @@ const AUTO_REFRESH_INTERVAL_SECS: u64 = 180;
 pub struct ReminderApp {
     account_form: AccountForm,
     accounts: Vec<AccountState>,
+    selected_account_login: Option<String>,
     secret_store: Option<AccountStore>,
     storage_warning: Option<String>,
     global_error: Option<String>,
@@ -64,6 +71,7 @@ impl ReminderApp {
         let mut app = Self {
             account_form: AccountForm::default(),
             accounts: Vec::new(),
+            selected_account_login: None,
             secret_store: None,
             storage_warning: None,
             global_error: None,
@@ -96,6 +104,7 @@ impl ReminderApp {
             }
         }
 
+        app.ensure_selected_account();
         app.auto_refresh.mark_triggered();
 
         app
@@ -108,10 +117,22 @@ impl ReminderApp {
             return;
         }
 
+        if self.accounts.iter().any(|account| {
+            account
+                .profile
+                .login
+                .eq_ignore_ascii_case(self.account_form.login.trim())
+        }) {
+            self.account_form.form_error =
+                Some("This GitHub login is already being tracked.".to_owned());
+            return;
+        }
+
         let profile = GitHubAccount {
             login: self.account_form.login.trim().to_owned(),
             token: self.account_form.token.trim().to_owned(),
         };
+        let selected_login = profile.login.clone();
 
         if let Some(store) = &self.secret_store {
             if let Err(err) = store.persist_profile(&profile) {
@@ -131,6 +152,7 @@ impl ReminderApp {
         state.start_refresh();
         self.auto_refresh.mark_triggered();
         self.accounts.push(state);
+        self.selected_account_login = Some(selected_login);
         self.account_form = AccountForm::default();
     }
 
@@ -147,6 +169,30 @@ impl ReminderApp {
         }
 
         self.accounts.remove(idx);
+        self.ensure_selected_account();
+    }
+
+    fn ensure_selected_account(&mut self) {
+        let Some(selected_login) = self.selected_account_login.as_deref() else {
+            self.selected_account_login = self
+                .accounts
+                .first()
+                .map(|account| account.profile.login.clone());
+            return;
+        };
+
+        if self
+            .accounts
+            .iter()
+            .any(|account| account.profile.login == selected_login)
+        {
+            return;
+        }
+
+        self.selected_account_login = self
+            .accounts
+            .first()
+            .map(|account| account.profile.login.clone());
     }
 
     fn poll_jobs(&mut self) {
@@ -215,18 +261,54 @@ impl ReminderApp {
         if self.accounts.is_empty() {
             ui.weak("No accounts yet.");
         } else {
+            let compact_rows = uses_compact_account_rows(ui.available_width());
+            let mut selected_login = None;
+            let mut refresh_idx = None;
             let mut remove_idx = None;
             for (idx, account) in self.accounts.iter_mut().enumerate() {
-                ui.horizontal(|row| {
-                    row.label(&account.profile.login);
-                    if row.small_button("Refresh").clicked() {
-                        account.start_refresh();
-                        self.auto_refresh.mark_triggered();
+                let overview = account_overview(account);
+                let pending = account.pending_job.is_some();
+                let has_error = account.last_error.is_some();
+                let is_selected =
+                    self.selected_account_login.as_deref() == Some(account.profile.login.as_str());
+                let heading = tracked_account_heading(ui, account, is_selected, overview);
+
+                ui.group(|group| {
+                    if group.selectable_label(is_selected, heading).clicked() {
+                        selected_login = Some(account.profile.login.clone());
                     }
-                    if row.small_button("Remove").clicked() {
-                        remove_idx = Some(idx);
+
+                    if compact_rows {
+                        render_tracked_account_badges(group, overview, pending, has_error);
+                        group.horizontal_wrapped(|row| {
+                            if row.small_button("Refresh").clicked() {
+                                refresh_idx = Some(idx);
+                            }
+                            if row.small_button("Remove").clicked() {
+                                remove_idx = Some(idx);
+                            }
+                        });
+                    } else {
+                        group.horizontal_wrapped(|row| {
+                            render_tracked_account_badges(row, overview, pending, has_error);
+                            if row.small_button("Refresh").clicked() {
+                                refresh_idx = Some(idx);
+                            }
+                            if row.small_button("Remove").clicked() {
+                                remove_idx = Some(idx);
+                            }
+                        });
                     }
                 });
+            }
+            if let Some(login) = selected_login {
+                self.selected_account_login = Some(login);
+            }
+            if let Some(idx) = refresh_idx
+                && let Some(account) = self.accounts.get_mut(idx)
+            {
+                account.start_refresh();
+                self.auto_refresh.mark_triggered();
             }
             if let Some(idx) = remove_idx {
                 self.remove_account_at(idx);
@@ -244,13 +326,31 @@ impl ReminderApp {
             return;
         }
 
+        let Some(selected_login) = self.selected_account_login.as_deref() else {
+            ui.centered_and_justified(|center| {
+                center.label("Select an account on the left to view notifications.");
+            });
+            return;
+        };
+
+        let Some(selected_idx) = self
+            .accounts
+            .iter()
+            .position(|account| account.profile.login == selected_login)
+        else {
+            ui.centered_and_justified(|center| {
+                center.label("Select an account on the left to view notifications.");
+            });
+            return;
+        };
+
         egui::ScrollArea::vertical().show(ui, |area| {
-            for account in &mut self.accounts {
-                let account_id = account.profile.login.clone();
-                area.push_id(account_id, |ui| {
-                    render_account_card(ui, account);
-                });
-            }
+            let account = &mut self.accounts[selected_idx];
+            account.clear_new_notifications();
+            let account_id = account.profile.login.clone();
+            area.push_id(account_id, |ui| {
+                render_account_card(ui, account);
+            });
         });
     }
 
@@ -272,26 +372,64 @@ fn render_account_card(ui: &mut egui::Ui, account: &mut AccountState) {
 }
 
 fn render_account_header(group: &mut egui::Ui, account: &mut AccountState) {
-    group.horizontal(|row| {
-        row.heading(format!("Account: {}", account.profile.login));
-        if row
-            .small_button(if account.expanded {
-                "Hide notifications"
-            } else {
-                "Show notifications"
-            })
-            .clicked()
-        {
-            account.expanded = !account.expanded;
-        }
-        row.with_layout(Layout::right_to_left(egui::Align::Center), |lane| {
-            lane.add(
+    if uses_stacked_account_header(group.available_width()) {
+        group.vertical(|column| {
+            column.horizontal_wrapped(|row| {
+                row.heading(format!("Account: {}", account.profile.login));
+                if row
+                    .small_button(if account.expanded {
+                        "Hide notifications"
+                    } else {
+                        "Show notifications"
+                    })
+                    .clicked()
+                {
+                    account.expanded = !account.expanded;
+                }
+            });
+            render_view_mode_toggle(column, account);
+            let search_width = column.available_width();
+            column.add(
                 egui::TextEdit::singleline(&mut account.search_query)
                     .hint_text("Search…")
-                    .desired_width(160.0),
+                    .desired_width(search_width),
             );
         });
-    });
+    } else {
+        group.horizontal(|row| {
+            row.heading(format!("Account: {}", account.profile.login));
+            if row
+                .small_button(if account.expanded {
+                    "Hide notifications"
+                } else {
+                    "Show notifications"
+                })
+                .clicked()
+            {
+                account.expanded = !account.expanded;
+            }
+            row.with_layout(Layout::right_to_left(egui::Align::Center), |lane| {
+                lane.add(
+                    egui::TextEdit::singleline(&mut account.search_query)
+                        .hint_text("Search…")
+                        .desired_width(160.0),
+                );
+                lane.add_space(8.0);
+                render_view_mode_toggle(lane, account);
+            });
+        });
+    }
+}
+
+fn render_view_mode_toggle(ui: &mut egui::Ui, account: &mut AccountState) {
+    ui.selectable_value(&mut account.view_mode, AccountViewMode::Grouped, "Grouped")
+        .on_hover_text("Group notifications into review requests, mentions, and everything else.");
+    ui.selectable_value(
+        &mut account.view_mode,
+        AccountViewMode::Inbox,
+        "Unified inbox",
+    )
+    .on_hover_text("Show every GitHub notification in one list, like GitHub's inbox.");
 }
 
 fn render_account_status(group: &mut egui::Ui, account: &AccountState) {
@@ -323,18 +461,45 @@ fn render_account_body(group: &mut egui::Ui, account: &mut AccountState) {
     if account.inbox.is_some() {
         group.separator();
         let filter = SearchFilter::new(&account.search_query);
-        let actions = render_account_sections(group, account, &filter);
+        let actions = match account.view_mode {
+            AccountViewMode::Inbox => render_unified_inbox_section(group, account, &filter),
+            AccountViewMode::Grouped => render_bucket_sections(group, account, &filter),
+        };
         for action in actions {
             match action {
-                AccountAction::MarkNotificationDone(id) => account.request_mark_done(id),
-                AccountAction::MarkNotificationSeen(id) => account.mark_notification_seen(&id),
-                AccountAction::MarkNotificationRead(id) => account.request_mark_read(id),
+                AccountAction::Done(id) => account.request_mark_done(id),
+                AccountAction::Seen(id) => account.mark_notification_seen(&id),
+                AccountAction::Read(id) => account.request_mark_read(id),
             }
         }
     }
 }
 
-fn render_account_sections(
+fn render_unified_inbox_section(
+    group: &mut egui::Ui,
+    account: &mut AccountState,
+    filter: &SearchFilter,
+) -> Vec<AccountAction> {
+    let inflight_done = account.inflight_done.clone();
+    let inbox = account.inbox.as_ref().expect("checked by caller");
+    let notifications: Vec<_> = inbox.notifications.iter().collect();
+
+    let (actions, cleared_highlight) = render_notification_section(
+        group,
+        "Inbox",
+        notifications,
+        "You're all caught up 🎉",
+        filter,
+        &inflight_done,
+        account.highlights.contains(&SectionKind::Inbox),
+    );
+    if cleared_highlight {
+        account.highlights.remove(&SectionKind::Inbox);
+    }
+    actions
+}
+
+fn render_bucket_sections(
     group: &mut egui::Ui,
     account: &mut AccountState,
     filter: &SearchFilter,
@@ -354,19 +519,19 @@ fn render_account_sections(
         .filter(|item| item.reason == REVIEW_REQUEST_REASON)
         .collect();
 
-    actions.extend(render_notification_section(
+    let (section_actions, cleared_highlight) = render_notification_section(
         group,
         "Review requests",
         review_requests,
         "No pending review requests.",
         filter,
         &inflight_done,
-        true,
         account.highlights.contains(&SectionKind::ReviewRequests),
-        || {
-            account.highlights.remove(&SectionKind::ReviewRequests);
-        },
-    ));
+    );
+    actions.extend(section_actions);
+    if cleared_highlight {
+        account.highlights.remove(&SectionKind::ReviewRequests);
+    }
     group.separator();
 
     let mentions: Vec<_> = inbox
@@ -374,19 +539,19 @@ fn render_account_sections(
         .iter()
         .filter(|item| MENTION_REASONS.contains(&item.reason.as_str()))
         .collect();
-    actions.extend(render_notification_section(
+    let (section_actions, cleared_highlight) = render_notification_section(
         group,
         "Mentions",
         mentions,
         "No recent mentions.",
         filter,
         &inflight_done,
-        true,
         account.highlights.contains(&SectionKind::Mentions),
-        || {
-            account.highlights.remove(&SectionKind::Mentions);
-        },
-    ));
+    );
+    actions.extend(section_actions);
+    if cleared_highlight {
+        account.highlights.remove(&SectionKind::Mentions);
+    }
     group.separator();
 
     let other: Vec<_> = inbox
@@ -396,19 +561,19 @@ fn render_account_sections(
             item.reason != REVIEW_REQUEST_REASON && !MENTION_REASONS.contains(&item.reason.as_str())
         })
         .collect();
-    actions.extend(render_notification_section(
+    let (section_actions, cleared_highlight) = render_notification_section(
         group,
         "Notifications",
         other,
         "You're all caught up 🎉",
         filter,
         &inflight_done,
-        true,
         account.highlights.contains(&SectionKind::Notifications),
-        || {
-            account.highlights.remove(&SectionKind::Notifications);
-        },
-    ));
+    );
+    actions.extend(section_actions);
+    if cleared_highlight {
+        account.highlights.remove(&SectionKind::Notifications);
+    }
 
     actions
 }
@@ -459,9 +624,12 @@ impl App for ReminderApp {
     fn update(&mut self, ctx: &Context, _frame: &mut Frame) {
         self.poll_jobs();
         self.maybe_auto_refresh();
+        self.ensure_selected_account();
+
+        let accounts_panel_width = responsive_accounts_panel_width(ctx.available_rect().width());
 
         egui::SidePanel::left("accounts_panel")
-            .default_width(260.0)
+            .exact_width(accounts_panel_width)
             .show(ctx, |ui| self.render_side_panel(ui));
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -479,10 +647,12 @@ impl App for ReminderApp {
 struct AccountState {
     profile: GitHubAccount,
     inbox: Option<InboxSnapshot>,
+    new_notification_ids: HashSet<String>,
     last_error: Option<String>,
     pending_job: Option<PendingJob>,
     pending_actions: Vec<NotificationActionJob>,
     expanded: bool,
+    view_mode: AccountViewMode,
     search_query: String,
     inflight_done: HashSet<String>,
     highlights: HashSet<SectionKind>,
@@ -493,10 +663,12 @@ impl AccountState {
         Self {
             profile,
             inbox: None,
+            new_notification_ids: HashSet::new(),
             last_error: None,
             pending_job: None,
             pending_actions: Vec::new(),
             expanded: true,
+            view_mode: AccountViewMode::Inbox,
             search_query: String::new(),
             inflight_done: HashSet::new(),
             highlights: HashSet::new(),
@@ -510,34 +682,47 @@ impl AccountState {
     }
 
     fn poll_job(&mut self) {
-        if let Some(job) = &mut self.pending_job {
-            if let Some(result) = job.try_take() {
-                self.pending_job = None;
-                match result {
-                    Ok(inbox) => {
-                        let previous_stats = self.inbox.as_ref().map(section_stats);
-                        let next_stats = section_stats(&inbox);
-                        if let Some(old) = previous_stats {
-                            if next_stats
-                                .review_requests
-                                .bumped_since(&old.review_requests)
-                            {
-                                self.highlights.insert(SectionKind::ReviewRequests);
-                            }
-                            if next_stats.mentions.bumped_since(&old.mentions) {
-                                self.highlights.insert(SectionKind::Mentions);
-                            }
-                            if next_stats.notifications.bumped_since(&old.notifications) {
-                                self.highlights.insert(SectionKind::Notifications);
-                            }
+        if let Some(job) = &mut self.pending_job
+            && let Some(result) = job.try_take()
+        {
+            self.pending_job = None;
+            match result {
+                Ok(inbox) => {
+                    let new_notification_ids =
+                        collect_new_notification_ids(self.inbox.as_ref(), &inbox);
+                    let current_ids: HashSet<_> = inbox
+                        .notifications
+                        .iter()
+                        .map(|item| item.thread_id.as_str())
+                        .collect();
+                    self.new_notification_ids
+                        .retain(|thread_id| current_ids.contains(thread_id.as_str()));
+                    self.new_notification_ids.extend(new_notification_ids);
+                    let previous_stats = self.inbox.as_ref().map(section_stats);
+                    let next_stats = section_stats(&inbox);
+                    if let Some(old) = previous_stats {
+                        if next_stats.inbox.bumped_since(&old.inbox) {
+                            self.highlights.insert(SectionKind::Inbox);
                         }
+                        if next_stats
+                            .review_requests
+                            .bumped_since(&old.review_requests)
+                        {
+                            self.highlights.insert(SectionKind::ReviewRequests);
+                        }
+                        if next_stats.mentions.bumped_since(&old.mentions) {
+                            self.highlights.insert(SectionKind::Mentions);
+                        }
+                        if next_stats.notifications.bumped_since(&old.notifications) {
+                            self.highlights.insert(SectionKind::Notifications);
+                        }
+                    }
 
-                        self.inbox = Some(inbox);
-                        self.last_error = None;
-                    }
-                    Err(err) => {
-                        self.last_error = Some(err.to_string());
-                    }
+                    self.inbox = Some(inbox);
+                    self.last_error = None;
+                }
+                Err(err) => {
+                    self.last_error = Some(err.to_string());
                 }
             }
         }
@@ -567,17 +752,16 @@ impl AccountState {
     }
 
     fn handle_action_success(&mut self, thread_id: &str) {
-        if let Some(inbox) = &mut self.inbox {
-            if let Some(item) = inbox
+        if let Some(inbox) = &mut self.inbox
+            && let Some(item) = inbox
                 .notifications
                 .iter_mut()
                 .find(|item| item.thread_id == thread_id)
-            {
-                item.unread = false;
-                // Consider the thread freshly read at the current timestamp so the
-                // "Updated" badge clears unless new events arrive.
-                item.last_read_at = Some(Utc::now());
-            }
+        {
+            item.unread = false;
+            // Consider the thread freshly read at the current timestamp so the
+            // "Updated" badge clears unless new events arrive.
+            item.last_read_at = Some(Utc::now());
         }
         self.inflight_done.remove(thread_id);
     }
@@ -585,17 +769,16 @@ impl AccountState {
     /// Mark a thread as seen the moment the user opens it so the UI reflects
     /// the visit without waiting for the next GitHub sync cycle.
     fn mark_notification_seen(&mut self, thread_id: &str) {
-        if let Some(inbox) = &mut self.inbox {
-            if let Some(item) = inbox
+        if let Some(inbox) = &mut self.inbox
+            && let Some(item) = inbox
                 .notifications
                 .iter_mut()
                 .find(|item| item.thread_id == thread_id)
-            {
-                item.unread = false;
-                // Advance the local last_read_at to the newest update to clear the
-                // "Updated" badge unless more activity arrives later.
-                item.last_read_at = Some(item.updated_at);
-            }
+        {
+            item.unread = false;
+            // Advance the local last_read_at to the newest update to clear the
+            // "Updated" badge unless more activity arrives later.
+            item.last_read_at = Some(item.updated_at);
         }
     }
 
@@ -627,6 +810,10 @@ impl AccountState {
                 Err(_) => true,
             },
         }
+    }
+
+    fn clear_new_notifications(&mut self) {
+        self.new_notification_ids.clear();
     }
 }
 
@@ -713,17 +900,15 @@ impl NotificationActionJob {
 // UI helpers
 // -----------------------------------------------------------------------------
 
-fn render_notification_section<'a, F: FnMut()>(
+fn render_notification_section(
     group: &mut egui::Ui,
     title: &str,
-    subset: Vec<&'a NotificationItem>,
+    subset: Vec<&NotificationItem>,
     empty_label: &'static str,
     filter: &SearchFilter,
     inflight_done: &HashSet<String>,
-    allow_done_action: bool,
     highlight: bool,
-    mut clear_highlight: F,
-) -> Vec<AccountAction> {
+) -> (Vec<AccountAction>, bool) {
     let (unseen_count, updated_count) = summarize_counts(&subset);
     let heading = format!(
         "{title} ({} unseen, {} updated)",
@@ -745,26 +930,14 @@ fn render_notification_section<'a, F: FnMut()>(
         let response = header.show(group, |section| {
             section.weak(empty_label);
         });
-        if response.body_returned.is_some() && highlight {
-            clear_highlight();
-        }
-        return Vec::new();
+        return (Vec::new(), response.body_returned.is_some() && highlight);
     }
 
     let mut actions = Vec::new();
     let response = header.show(group, |section| {
-        actions.extend(draw_notifications(
-            section,
-            &subset,
-            filter,
-            inflight_done,
-            allow_done_action,
-        ));
+        actions.extend(draw_notifications(section, &subset, filter, inflight_done));
     });
-    if response.body_returned.is_some() && highlight {
-        clear_highlight();
-    }
-    actions
+    (actions, response.body_returned.is_some() && highlight)
 }
 
 fn summarize_counts(items: &[&NotificationItem]) -> (usize, usize) {
@@ -798,6 +971,7 @@ impl SectionCounts {
 }
 
 struct SectionStats {
+    inbox: SectionCounts,
     review_requests: SectionCounts,
     mentions: SectionCounts,
     notifications: SectionCounts,
@@ -807,6 +981,7 @@ fn section_stats(inbox: &InboxSnapshot) -> SectionStats {
     const REVIEW_REQUEST_REASON: &str = "review_requested";
     const MENTION_REASONS: &[&str] = &["mention", "team_mention"];
 
+    let all_notifications: Vec<_> = inbox.notifications.iter().collect();
     let review_requests: Vec<_> = inbox
         .notifications
         .iter()
@@ -825,11 +1000,13 @@ fn section_stats(inbox: &InboxSnapshot) -> SectionStats {
         })
         .collect();
 
+    let (inbox_unseen, inbox_updated) = summarize_counts(&all_notifications);
     let (rr_unseen, rr_updated) = summarize_counts(&review_requests);
     let (m_unseen, m_updated) = summarize_counts(&mentions);
     let (o_unseen, o_updated) = summarize_counts(&other);
 
     SectionStats {
+        inbox: SectionCounts::new(inbox_unseen, inbox_updated),
         review_requests: SectionCounts::new(rr_unseen, rr_updated),
         mentions: SectionCounts::new(m_unseen, m_updated),
         notifications: SectionCounts::new(o_unseen, o_updated),
@@ -879,9 +1056,7 @@ fn draw_notifications(
     items: &[&NotificationItem],
     filter: &SearchFilter,
     inflight_done: &HashSet<String>,
-    allow_done_action: bool,
 ) -> Vec<AccountAction> {
-    let mut actions = Vec::new();
     let rows: Vec<_> = items
         .iter()
         .copied()
@@ -889,18 +1064,102 @@ fn draw_notifications(
         .collect();
     if rows.is_empty() {
         ui.weak("No matches for current search.");
-        return actions;
+        return Vec::new();
     }
+
+    if uses_compact_notifications(ui.available_width()) {
+        return draw_notification_cards(ui, &rows, inflight_done);
+    }
+
+    draw_notification_table(ui, &rows, inflight_done)
+}
+
+fn draw_notification_cards(
+    ui: &mut egui::Ui,
+    rows: &[&NotificationItem],
+    inflight_done: &HashSet<String>,
+) -> Vec<AccountAction> {
+    let mut actions = Vec::new();
+
+    for item in rows {
+        let visual = notification_state(item);
+        ui.group(|card| {
+            card.vertical(|column| {
+                column.horizontal_wrapped(|row| {
+                    row.label(notification_text(row, &item.repo, visual));
+                    row.separator();
+                    row.label(notification_text(
+                        row,
+                        item.updated_at.format("%Y-%m-%d %H:%M").to_string(),
+                        visual,
+                    ));
+                    if visual.needs_revisit {
+                        row.small(
+                            RichText::new("Updated")
+                                .strong()
+                                .color(row.visuals().warn_fg_color),
+                        );
+                    }
+                });
+
+                if let Some(url) = &item.url {
+                    let resp =
+                        column.hyperlink_to(notification_text(column, &item.title, visual), url);
+                    if resp.clicked() {
+                        actions.push(AccountAction::Seen(item.thread_id.clone()));
+                    }
+                } else {
+                    let resp = column.label(notification_text(column, &item.title, visual));
+                    if resp.clicked() {
+                        actions.push(AccountAction::Seen(item.thread_id.clone()));
+                    }
+                }
+
+                column.small(notification_text(
+                    column,
+                    format!("Reason: {}", &item.reason),
+                    visual,
+                ));
+
+                column.horizontal_wrapped(|row| {
+                    let busy = inflight_done.contains(&item.thread_id);
+                    let already_read = !item.unread && !visual.needs_revisit;
+
+                    if row
+                        .add_enabled(!busy && !already_read, egui::Button::new("Mark read"))
+                        .clicked()
+                    {
+                        actions.push(AccountAction::Read(item.thread_id.clone()));
+                    }
+
+                    if busy {
+                        row.spinner();
+                    }
+                });
+            });
+        });
+        ui.add_space(8.0);
+    }
+
+    actions
+}
+
+fn draw_notification_table(
+    ui: &mut egui::Ui,
+    rows: &[&NotificationItem],
+    inflight_done: &HashSet<String>,
+) -> Vec<AccountAction> {
+    let mut actions = Vec::new();
 
     egui::ScrollArea::horizontal()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             TableBuilder::new(ui)
                 .striped(true)
-                .column(Column::initial(140.0).resizable(true))
-                .column(Column::remainder().at_least(180.0))
-                .column(Column::initial(170.0).resizable(true))
-                .column(Column::initial(110.0))
+                .column(Column::initial(120.0).resizable(true))
+                .column(Column::remainder().at_least(140.0))
+                .column(Column::initial(130.0).resizable(true))
+                .column(Column::initial(100.0))
                 .header(20.0, |mut header| {
                     header.col(|ui| {
                         ui.strong("Repository");
@@ -917,7 +1176,6 @@ fn draw_notifications(
                 })
                 .body(|mut body| {
                     for item in rows {
-                        let _thread_id = &item.thread_id;
                         let visual = notification_state(item);
                         body.row(24.0, |mut row| {
                             row.col(|ui| {
@@ -929,16 +1187,14 @@ fn draw_notifications(
                                     if let Some(url) = &item.url {
                                         let resp = row_ui.hyperlink_to(subject, url);
                                         if resp.clicked() {
-                                            actions.push(AccountAction::MarkNotificationSeen(
-                                                item.thread_id.clone(),
-                                            ));
+                                            actions
+                                                .push(AccountAction::Seen(item.thread_id.clone()));
                                         }
                                     } else {
                                         let resp = row_ui.label(subject);
                                         if resp.clicked() {
-                                            actions.push(AccountAction::MarkNotificationSeen(
-                                                item.thread_id.clone(),
-                                            ));
+                                            actions
+                                                .push(AccountAction::Seen(item.thread_id.clone()));
                                         }
                                     }
                                     if visual.needs_revisit {
@@ -973,16 +1229,13 @@ fn draw_notifications(
                                     )
                                     .clicked()
                                 {
-                                    actions.push(AccountAction::MarkNotificationRead(
-                                        item.thread_id.clone(),
-                                    ));
+                                    actions.push(AccountAction::Read(item.thread_id.clone()));
                                 }
 
                                 // Keep layout width consistent even when disabled.
                                 if busy {
                                     ui.spinner();
                                 }
-                                let _ = allow_done_action;
                             });
                         });
                     }
@@ -991,22 +1244,140 @@ fn draw_notifications(
     actions
 }
 
+fn responsive_accounts_panel_width(window_width: f32) -> f32 {
+    (window_width * ACCOUNTS_PANEL_WIDTH_RATIO)
+        .clamp(ACCOUNTS_PANEL_MIN_WIDTH, ACCOUNTS_PANEL_MAX_WIDTH)
+}
+
+fn tracked_account_heading(
+    ui: &egui::Ui,
+    account: &AccountState,
+    is_selected: bool,
+    overview: Option<AccountOverview>,
+) -> RichText {
+    let has_new = overview
+        .map(|overview| overview.new_notifications > 0)
+        .unwrap_or(false);
+    let mut text = RichText::new(&account.profile.login);
+    if is_selected || has_new {
+        text = text.strong();
+    }
+    if has_new && !is_selected {
+        text = text.color(ui.visuals().warn_fg_color);
+    }
+    text
+}
+
+fn render_tracked_account_badges(
+    ui: &mut egui::Ui,
+    overview: Option<AccountOverview>,
+    pending: bool,
+    has_error: bool,
+) {
+    if let Some(overview) = overview {
+        if overview.new_notifications > 0 {
+            ui.small(
+                RichText::new(format!("new +{}", overview.new_notifications))
+                    .strong()
+                    .color(ui.visuals().warn_fg_color),
+            );
+        }
+        ui.small(format!("unseen {}", overview.unseen));
+        let updated = if overview.updated > 0 {
+            RichText::new(format!("updated {}", overview.updated)).color(ui.visuals().warn_fg_color)
+        } else {
+            RichText::new(format!("updated {}", overview.updated))
+                .color(ui.visuals().weak_text_color())
+        };
+        ui.small(updated);
+    } else if pending {
+        ui.small(RichText::new("Loading…").color(ui.visuals().weak_text_color()));
+    } else {
+        ui.small(RichText::new("No data yet").color(ui.visuals().weak_text_color()));
+    }
+
+    if pending {
+        ui.small(RichText::new("syncing…").color(ui.visuals().weak_text_color()));
+    }
+    if has_error {
+        ui.small(RichText::new("sync failed").color(ui.visuals().error_fg_color));
+    }
+}
+
+fn collect_new_notification_ids(
+    previous: Option<&InboxSnapshot>,
+    next: &InboxSnapshot,
+) -> HashSet<String> {
+    let Some(previous) = previous else {
+        return HashSet::new();
+    };
+
+    let known_ids: HashSet<_> = previous
+        .notifications
+        .iter()
+        .map(|item| item.thread_id.as_str())
+        .collect();
+
+    next.notifications
+        .iter()
+        .filter(|item| !known_ids.contains(item.thread_id.as_str()))
+        .map(|item| item.thread_id.clone())
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AccountOverview {
+    new_notifications: usize,
+    unseen: usize,
+    updated: usize,
+}
+
+fn account_overview(account: &AccountState) -> Option<AccountOverview> {
+    account.inbox.as_ref().map(|inbox| {
+        let stats = section_stats(inbox);
+        AccountOverview {
+            new_notifications: account.new_notification_ids.len(),
+            unseen: stats.inbox.unseen,
+            updated: stats.inbox.updated,
+        }
+    })
+}
+
+fn uses_compact_account_rows(available_width: f32) -> bool {
+    available_width < COMPACT_ACCOUNT_ROW_WIDTH
+}
+
+fn uses_stacked_account_header(available_width: f32) -> bool {
+    available_width < STACKED_ACCOUNT_HEADER_WIDTH
+}
+
+fn uses_compact_notifications(available_width: f32) -> bool {
+    available_width < COMPACT_NOTIFICATION_WIDTH
+}
+
 // -----------------------------------------------------------------------------
 // Supporting structs
 // -----------------------------------------------------------------------------
 
 #[allow(dead_code)]
 enum AccountAction {
-    MarkNotificationDone(String),
-    MarkNotificationSeen(String),
-    MarkNotificationRead(String),
+    Done(String),
+    Seen(String),
+    Read(String),
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 enum SectionKind {
+    Inbox,
     ReviewRequests,
     Mentions,
     Notifications,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountViewMode {
+    Inbox,
+    Grouped,
 }
 
 #[derive(Default)]
@@ -1117,6 +1488,25 @@ mod tests {
         }
     }
 
+    fn make_account(login: &str) -> AccountState {
+        AccountState::new(GitHubAccount {
+            login: login.into(),
+            token: "token".into(),
+        })
+    }
+
+    fn app_with_accounts(logins: &[&str]) -> ReminderApp {
+        ReminderApp {
+            account_form: AccountForm::default(),
+            accounts: logins.iter().map(|login| make_account(login)).collect(),
+            selected_account_login: None,
+            secret_store: None,
+            storage_warning: None,
+            global_error: None,
+            auto_refresh: BatchRefreshScheduler::new(Duration::from_secs(1)),
+        }
+    }
+
     #[test]
     fn section_stats_groups_by_reason() {
         let inbox = inbox_with_notifications(vec![
@@ -1125,9 +1515,16 @@ mod tests {
             notif("3", "subscribed", false, "2024-01-01 00:00:00"),
         ]);
         let stats = section_stats(&inbox);
+        assert_eq!(stats.inbox.unseen, 2);
         assert_eq!(stats.review_requests.unseen, 1);
         assert_eq!(stats.mentions.unseen, 1);
         assert_eq!(stats.notifications.unseen, 0);
+    }
+
+    #[test]
+    fn new_accounts_start_in_inbox_view() {
+        let account = AccountState::new(dummy_profile());
+        assert_eq!(account.view_mode, AccountViewMode::Inbox);
     }
 
     #[test]
@@ -1161,6 +1558,94 @@ mod tests {
     }
 
     #[test]
+    fn accounts_panel_width_is_clamped() {
+        assert_eq!(
+            responsive_accounts_panel_width(300.0),
+            ACCOUNTS_PANEL_MIN_WIDTH
+        );
+        assert_eq!(
+            responsive_accounts_panel_width(2_000.0),
+            ACCOUNTS_PANEL_MAX_WIDTH
+        );
+    }
+
+    #[test]
+    fn narrow_layout_helpers_switch_at_breakpoints() {
+        assert!(uses_compact_account_rows(COMPACT_ACCOUNT_ROW_WIDTH - 1.0));
+        assert!(uses_stacked_account_header(
+            STACKED_ACCOUNT_HEADER_WIDTH - 1.0
+        ));
+        assert!(uses_compact_notifications(COMPACT_NOTIFICATION_WIDTH - 1.0));
+        assert!(!uses_compact_notifications(
+            COMPACT_NOTIFICATION_WIDTH + 1.0
+        ));
+    }
+
+    #[test]
+    fn ensure_selected_account_falls_back_to_first_account() {
+        let mut app = app_with_accounts(&["alpha", "beta"]);
+        app.selected_account_login = Some("missing".into());
+
+        app.ensure_selected_account();
+
+        assert_eq!(app.selected_account_login.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn collect_new_notification_ids_ignores_initial_sync() {
+        let next =
+            inbox_with_notifications(vec![notif("1", "subscribed", true, "2024-01-01 00:00:00")]);
+
+        assert!(collect_new_notification_ids(None, &next).is_empty());
+    }
+
+    #[test]
+    fn collect_new_notification_ids_detects_added_threads() {
+        let previous = inbox_with_notifications(vec![
+            notif("1", "subscribed", true, "2024-01-01 00:00:00"),
+            notif("2", "mention", true, "2024-01-01 00:00:00"),
+        ]);
+        let next = inbox_with_notifications(vec![
+            notif("2", "mention", true, "2024-01-01 00:00:00"),
+            notif("3", "review_requested", true, "2024-01-01 00:00:00"),
+        ]);
+
+        let new_ids = collect_new_notification_ids(Some(&previous), &next);
+
+        assert_eq!(new_ids.len(), 1);
+        assert!(new_ids.contains("3"));
+    }
+
+    #[test]
+    fn account_overview_reports_sidebar_counts() {
+        let mut account = make_account("alpha");
+        account.inbox = Some(inbox_with_notifications(vec![
+            notif("1", "subscribed", true, "2024-01-01 00:00:00"),
+            notif("2", "subscribed", false, "2024-01-02 00:00:00"),
+        ]));
+        account.new_notification_ids = [String::from("2"), String::from("3")].into_iter().collect();
+        if let Some(inbox) = &mut account.inbox {
+            inbox.notifications[1].last_read_at = Some(parse_utc("2024-01-01 00:00:00"));
+        }
+
+        let overview = account_overview(&account).expect("overview should exist");
+
+        assert_eq!(overview.new_notifications, 2);
+        assert_eq!(overview.unseen, 1);
+        assert_eq!(overview.updated, 1);
+    }
+
+    #[test]
+    fn clear_new_notifications_resets_sidebar_badge_state() {
+        let mut account = make_account("alpha");
+        account.new_notification_ids = [String::from("1")].into_iter().collect();
+
+        account.clear_new_notifications();
+
+        assert!(account.new_notification_ids.is_empty());
+    }
+
+    #[test]
     fn notification_state_detects_revisit() {
         let mut item = notif("1", "subscribed", false, "2024-01-02 00:00:00");
         item.last_read_at = Some(parse_utc("2024-01-01 00:00:00"));
@@ -1184,7 +1669,7 @@ mod tests {
 
         ctx.begin_pass(Default::default());
         egui::CentralPanel::default().show(&ctx, |ui| {
-            let _ = render_account_sections(ui, &mut account, &filter);
+            let _ = render_bucket_sections(ui, &mut account, &filter);
         });
         let _ = ctx.end_pass();
 
@@ -1209,7 +1694,7 @@ mod tests {
         // Frame 1: render and manually collapse the notifications section.
         ctx.begin_pass(Default::default());
         egui::CentralPanel::default().show(&ctx, |ui| {
-            let _ = render_account_sections(ui, &mut account, &filter);
+            let _ = render_bucket_sections(ui, &mut account, &filter);
         });
         let id = egui::Id::new("notification-section-Notifications");
         let mut state = CollapsingState::load_with_default_open(&ctx, id, true);
@@ -1221,7 +1706,7 @@ mod tests {
         ctx.begin_pass(Default::default());
         let mut stayed_collapsed = true;
         egui::CentralPanel::default().show(&ctx, |ui| {
-            let response = render_account_sections(ui, &mut account, &filter);
+            let response = render_bucket_sections(ui, &mut account, &filter);
             let state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
             stayed_collapsed = !state.is_open();
             assert!(response.is_empty(), "Rendering should not trigger actions");
