@@ -1,32 +1,43 @@
-use std::{env, fs, io, path::PathBuf};
+use std::{collections::BTreeMap, env, fs, io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::domain::GitHubAccount;
+use crate::domain::{GitHubAccount, ReviewCommandSettings};
 
 const STORAGE_DIR_NAME: &str = ".reminder";
 const REGISTRY_FILE: &str = "accounts.json";
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 pub struct StoredAccounts {
+    #[serde(default)]
     pub accounts: Vec<StoredAccount>,
+    #[serde(default)]
+    pub repo_paths: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StoredAccount {
     pub login: String,
     pub token: String,
+    #[serde(default)]
+    pub review_settings: ReviewCommandSettings,
 }
 
 impl StoredAccounts {
-    fn upsert(&mut self, login: &str, token: &str) {
-        if let Some(existing) = self.accounts.iter_mut().find(|entry| entry.login == login) {
-            existing.token = token.to_owned();
+    fn upsert(&mut self, profile: &GitHubAccount) {
+        if let Some(existing) = self
+            .accounts
+            .iter_mut()
+            .find(|entry| entry.login == profile.login)
+        {
+            existing.token = profile.token.clone();
+            existing.review_settings = profile.review_settings.clone();
         } else {
             self.accounts.push(StoredAccount {
-                login: login.to_owned(),
-                token: token.to_owned(),
+                login: profile.login.clone(),
+                token: profile.token.clone(),
+                review_settings: profile.review_settings.clone(),
             });
             self.accounts.sort_by(|a, b| a.login.cmp(&b.login));
         }
@@ -34,6 +45,14 @@ impl StoredAccounts {
 
     fn remove(&mut self, login: &str) {
         self.accounts.retain(|entry| entry.login != login);
+    }
+
+    fn upsert_repo_path(&mut self, repo: &str, path: &str) {
+        self.repo_paths.insert(repo.to_owned(), path.to_owned());
+    }
+
+    fn remove_repo_path(&mut self, repo: &str) {
+        self.repo_paths.remove(repo);
     }
 }
 
@@ -43,6 +62,7 @@ pub struct AccountStore {
 
 pub struct HydrationOutcome {
     pub profiles: Vec<GitHubAccount>,
+    pub repo_paths: BTreeMap<String, String>,
 }
 
 impl AccountStore {
@@ -65,15 +85,19 @@ impl AccountStore {
             .map(|entry| GitHubAccount {
                 login: entry.login,
                 token: entry.token,
+                review_settings: entry.review_settings,
             })
             .collect();
 
-        Ok(HydrationOutcome { profiles })
+        Ok(HydrationOutcome {
+            profiles,
+            repo_paths: registry.repo_paths,
+        })
     }
 
     pub fn persist_profile(&self, profile: &GitHubAccount) -> Result<(), SecretStoreError> {
         let mut registry = self.read_registry()?;
-        registry.upsert(&profile.login, &profile.token);
+        registry.upsert(profile);
         self.write_registry(&registry)?;
         Ok(())
     }
@@ -81,6 +105,20 @@ impl AccountStore {
     pub fn forget(&self, login: &str) -> Result<(), SecretStoreError> {
         let mut registry = self.read_registry()?;
         registry.remove(login);
+        self.write_registry(&registry)?;
+        Ok(())
+    }
+
+    pub fn persist_repo_path(&self, repo: &str, path: &str) -> Result<(), SecretStoreError> {
+        let mut registry = self.read_registry()?;
+        registry.upsert_repo_path(repo, path);
+        self.write_registry(&registry)?;
+        Ok(())
+    }
+
+    pub fn forget_repo_path(&self, repo: &str) -> Result<(), SecretStoreError> {
+        let mut registry = self.read_registry()?;
+        registry.remove_repo_path(repo);
         self.write_registry(&registry)?;
         Ok(())
     }
@@ -108,4 +146,29 @@ pub enum SecretStoreError {
     Io(#[from] io::Error),
     #[error("Failed to serialize stored accounts: {0}")]
     Serialization(#[from] serde_json::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StoredAccounts;
+
+    #[test]
+    fn stored_accounts_defaults_missing_review_settings() {
+        let stored: StoredAccounts = serde_json::from_str(
+            r#"{
+                "accounts": [{"login": "neo", "token": "secret"}],
+                "repo_paths": {"acme/repo": "/tmp/acme-repo"}
+            }"#,
+        )
+        .expect("stored accounts");
+
+        assert_eq!(stored.accounts.len(), 1);
+        assert!(stored.accounts[0].review_settings.env_vars.is_empty());
+        assert!(
+            stored.accounts[0]
+                .review_settings
+                .additional_args
+                .is_empty()
+        );
+    }
 }

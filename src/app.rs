@@ -1,21 +1,33 @@
-use std::{
-    collections::HashSet,
-    fs,
-    sync::mpsc::{self, Receiver, TryRecvError},
-    thread,
-    time::{Duration, Instant},
-};
+mod fonts;
+mod notification_state;
+mod repo_paths;
+mod review;
+mod scheduler;
+mod search;
+mod state;
+mod ui;
 
-use chrono::Utc;
+use std::{collections::BTreeMap, fs, time::Duration};
+
 use eframe::{
     App, CreationContext, Frame,
-    egui::{self, Context, FontData, FontDefinitions, FontFamily, Layout, RichText},
+    egui::{self, Color32, Context},
 };
-use egui_extras::{Column, TableBuilder};
+
+use self::{
+    fonts::install_international_fonts,
+    repo_paths::{canonical_repo_key, normalize_hydrated_repo_paths},
+    review::{custom_review_command_available, render_review_window},
+    scheduler::BatchRefreshScheduler,
+    state::AccountState,
+    ui::{
+        account_overview, render_account_card, render_tracked_account_badges,
+        responsive_accounts_panel_width, tracked_account_heading, uses_compact_account_rows,
+    },
+};
 
 use crate::{
-    domain::{GitHubAccount, InboxSnapshot, NotificationItem},
-    github::{self, FetchError},
+    domain::{GitHubAccount, ReviewCommandSettings},
     storage::AccountStore,
 };
 
@@ -28,6 +40,12 @@ const ACCOUNTS_PANEL_WIDTH_RATIO: f32 = 0.24;
 const COMPACT_ACCOUNT_ROW_WIDTH: f32 = 180.0;
 const STACKED_ACCOUNT_HEADER_WIDTH: f32 = 620.0;
 const COMPACT_NOTIFICATION_WIDTH: f32 = 640.0;
+const CUSTOM_REVIEW_COMMAND_NAME: &str = "review-pr";
+const MAX_REVIEW_OUTPUT_CHARS: usize = 20_000;
+const ACTIVE_REVIEW_REPAINT_MS: u64 = 50;
+const REVIEW_REQUEST_REASON: &str = "review_requested";
+const MENTION_REASONS: &[&str] = &["mention", "team_mention"];
+const PENDING_REVIEW_LABEL_COLOR: Color32 = Color32::from_rgb(120, 200, 255);
 
 #[cfg(target_os = "macos")]
 const SYSTEM_FONT_CANDIDATES: &[&str] = &[
@@ -56,7 +74,10 @@ const AUTO_REFRESH_INTERVAL_SECS: u64 = 180;
 
 pub struct ReminderApp {
     account_form: AccountForm,
+    repo_path_form: RepoPathForm,
+    review_settings_editor: Option<AccountReviewSettingsEditor>,
     accounts: Vec<AccountState>,
+    repo_paths: BTreeMap<String, String>,
     selected_account_login: Option<String>,
     secret_store: Option<AccountStore>,
     storage_warning: Option<String>,
@@ -70,7 +91,10 @@ impl ReminderApp {
 
         let mut app = Self {
             account_form: AccountForm::default(),
+            repo_path_form: RepoPathForm::default(),
+            review_settings_editor: None,
             accounts: Vec::new(),
+            repo_paths: BTreeMap::new(),
             selected_account_login: None,
             secret_store: None,
             storage_warning: None,
@@ -88,6 +112,14 @@ impl ReminderApp {
                             let mut state = AccountState::new(profile);
                             state.start_refresh();
                             app.accounts.push(state);
+                        }
+                        let (repo_paths, dropped_repo_paths) =
+                            normalize_hydrated_repo_paths(outcome.repo_paths);
+                        app.repo_paths = repo_paths;
+                        if dropped_repo_paths > 0 {
+                            app.storage_warning = Some(format!(
+                                "Skipped {dropped_repo_paths} invalid local repo path mapping(s) while restoring settings."
+                            ));
                         }
                     }
                     Err(err) => {
@@ -131,6 +163,7 @@ impl ReminderApp {
         let profile = GitHubAccount {
             login: self.account_form.login.trim().to_owned(),
             token: self.account_form.token.trim().to_owned(),
+            review_settings: ReviewCommandSettings::default(),
         };
         let selected_login = profile.login.clone();
 
@@ -168,8 +201,203 @@ impl ReminderApp {
             self.global_error = Some(format!("Failed to remove credentials for {login}: {err}"));
         }
 
+        if self
+            .review_settings_editor
+            .as_ref()
+            .is_some_and(|editor| editor.login == login)
+        {
+            self.review_settings_editor = None;
+        }
+
         self.accounts.remove(idx);
         self.ensure_selected_account();
+    }
+
+    fn save_repo_path(&mut self) {
+        let Some(repo) = canonical_repo_key(&self.repo_path_form.repo) else {
+            self.repo_path_form.form_error =
+                Some("Repository must be in the form owner/repo.".to_owned());
+            return;
+        };
+
+        let raw_path = self.repo_path_form.path.trim();
+        if raw_path.is_empty() {
+            self.repo_path_form.form_error = Some("A local checkout path is required.".to_owned());
+            return;
+        }
+
+        let canonical_path = match fs::canonicalize(raw_path) {
+            Ok(path) => path,
+            Err(err) => {
+                self.repo_path_form.form_error =
+                    Some(format!("Unable to resolve checkout path: {err}"));
+                return;
+            }
+        };
+
+        if !canonical_path.is_dir() {
+            self.repo_path_form.form_error =
+                Some("Local checkout path must point to a directory.".to_owned());
+            return;
+        }
+
+        if !canonical_path.join(".git").exists() {
+            self.repo_path_form.form_error =
+                Some("Local checkout path must point to a git repository.".to_owned());
+            return;
+        }
+
+        let canonical_path = canonical_path.display().to_string();
+        if let Some(store) = &self.secret_store {
+            if let Err(err) = store.persist_repo_path(&repo, &canonical_path) {
+                self.repo_path_form.form_error =
+                    Some(format!("Unable to persist local repo path: {err}"));
+                return;
+            }
+        } else {
+            self.repo_path_form.form_error = Some(
+                "Local storage is not available; cannot save repo paths right now.".to_owned(),
+            );
+            return;
+        }
+
+        self.repo_paths.insert(repo, canonical_path);
+        self.repo_path_form = RepoPathForm::default();
+    }
+
+    fn open_review_settings_editor(&mut self, login: &str) {
+        let Some(account) = self
+            .accounts
+            .iter()
+            .find(|account| account.profile.login == login)
+        else {
+            self.global_error = Some(format!("Cannot find account settings for {login}."));
+            return;
+        };
+
+        self.review_settings_editor = Some(AccountReviewSettingsEditor {
+            login: account.profile.login.clone(),
+            env_vars_text: format_review_env_vars(&account.profile.review_settings),
+            additional_args_text: format_review_additional_args(&account.profile.review_settings),
+            form_error: None,
+        });
+    }
+
+    fn save_review_settings(&mut self) {
+        let Some(editor) = self.review_settings_editor.as_ref() else {
+            return;
+        };
+
+        let env_vars = match parse_review_env_vars(&editor.env_vars_text) {
+            Ok(env_vars) => env_vars,
+            Err(err) => {
+                if let Some(editor) = &mut self.review_settings_editor {
+                    editor.form_error = Some(err);
+                }
+                return;
+            }
+        };
+
+        let additional_args = parse_review_additional_args(&editor.additional_args_text);
+        let login = editor.login.clone();
+        let review_settings = ReviewCommandSettings {
+            env_vars,
+            additional_args,
+        };
+
+        let Some(account_idx) = self
+            .accounts
+            .iter()
+            .position(|account| account.profile.login == login)
+        else {
+            self.review_settings_editor = None;
+            self.global_error = Some(format!("Cannot find account settings for {login}."));
+            return;
+        };
+
+        let mut profile = self.accounts[account_idx].profile.clone();
+        profile.review_settings = review_settings.clone();
+
+        if let Some(store) = &self.secret_store {
+            if let Err(err) = store.persist_profile(&profile) {
+                if let Some(editor) = &mut self.review_settings_editor {
+                    editor.form_error = Some(format!("Unable to save review settings: {err}"));
+                }
+                return;
+            }
+        } else if let Some(editor) = &mut self.review_settings_editor {
+            editor.form_error = Some(
+                "Local storage is not available; cannot save review settings right now.".to_owned(),
+            );
+            return;
+        }
+
+        self.accounts[account_idx].profile.review_settings = review_settings;
+        self.review_settings_editor = None;
+    }
+
+    fn render_review_settings_window(&mut self, ctx: &Context) {
+        let Some(editor) = self.review_settings_editor.as_mut() else {
+            return;
+        };
+
+        let mut open = true;
+        let mut save_requested = false;
+        let mut cancel_requested = false;
+        let title = format!("Review settings: {}", editor.login);
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(egui::vec2(520.0, 360.0))
+            .show(ctx, |ui| {
+                ui.label("Environment variables (one KEY=VALUE per line)");
+                ui.add(
+                    egui::TextEdit::multiline(&mut editor.env_vars_text)
+                        .desired_rows(8)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(8.0);
+                ui.label("Additional args (split on whitespace)");
+                ui.add(
+                    egui::TextEdit::multiline(&mut editor.additional_args_text)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("--lang korean"),
+                );
+
+                if let Some(error) = &editor.form_error {
+                    ui.add_space(8.0);
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|row| {
+                    if row.button("Save").clicked() {
+                        save_requested = true;
+                    }
+                    if row.button("Cancel").clicked() {
+                        cancel_requested = true;
+                    }
+                });
+            });
+
+        if save_requested {
+            self.save_review_settings();
+        } else if cancel_requested || !open {
+            self.review_settings_editor = None;
+        }
+    }
+
+    fn remove_repo_path(&mut self, repo: &str) {
+        if let Some(store) = &self.secret_store
+            && let Err(err) = store.forget_repo_path(repo)
+        {
+            self.global_error = Some(format!("Failed to remove repo path for {repo}: {err}"));
+            return;
+        }
+
+        self.repo_paths.remove(repo);
     }
 
     fn ensure_selected_account(&mut self) {
@@ -199,7 +427,15 @@ impl ReminderApp {
         for account in &mut self.accounts {
             account.poll_job();
             account.poll_action_jobs();
+            account.poll_review_job();
         }
+    }
+
+    fn selected_account_index(&self) -> Option<usize> {
+        let selected_login = self.selected_account_login.as_deref()?;
+        self.accounts
+            .iter()
+            .position(|account| account.profile.login == selected_login)
     }
 
     fn maybe_auto_refresh(&mut self) {
@@ -265,6 +501,7 @@ impl ReminderApp {
             let mut selected_login = None;
             let mut refresh_idx = None;
             let mut remove_idx = None;
+            let mut settings_login = None;
             for (idx, account) in self.accounts.iter_mut().enumerate() {
                 let overview = account_overview(account);
                 let pending = account.pending_job.is_some();
@@ -284,6 +521,9 @@ impl ReminderApp {
                             if row.small_button("Refresh").clicked() {
                                 refresh_idx = Some(idx);
                             }
+                            if row.small_button("Settings").clicked() {
+                                settings_login = Some(account.profile.login.clone());
+                            }
                             if row.small_button("Remove").clicked() {
                                 remove_idx = Some(idx);
                             }
@@ -293,6 +533,9 @@ impl ReminderApp {
                             render_tracked_account_badges(row, overview, pending, has_error);
                             if row.small_button("Refresh").clicked() {
                                 refresh_idx = Some(idx);
+                            }
+                            if row.small_button("Settings").clicked() {
+                                settings_login = Some(account.profile.login.clone());
                             }
                             if row.small_button("Remove").clicked() {
                                 remove_idx = Some(idx);
@@ -304,6 +547,9 @@ impl ReminderApp {
             if let Some(login) = selected_login {
                 self.selected_account_login = Some(login);
             }
+            if let Some(login) = settings_login {
+                self.open_review_settings_editor(&login);
+            }
             if let Some(idx) = refresh_idx
                 && let Some(account) = self.accounts.get_mut(idx)
             {
@@ -312,6 +558,51 @@ impl ReminderApp {
             }
             if let Some(idx) = remove_idx {
                 self.remove_account_at(idx);
+            }
+        }
+
+        ui.separator();
+        ui.label("Local repo paths");
+        if custom_review_command_available() {
+            ui.small(
+                "Mapped repos can use your custom `review-pr` opencode command. Unmapped repos cannot be reviewed.",
+            );
+        } else {
+            ui.small("No custom `review-pr` command detected. Reviews are unavailable.");
+        }
+        ui.label("Repository (owner/repo)");
+        ui.text_edit_singleline(&mut self.repo_path_form.repo);
+        ui.label("Local checkout path");
+        ui.text_edit_singleline(&mut self.repo_path_form.path);
+
+        let save_repo_path_enabled = !self.repo_path_form.repo.trim().is_empty()
+            && !self.repo_path_form.path.trim().is_empty();
+        if ui
+            .add_enabled(save_repo_path_enabled, egui::Button::new("Save repo path"))
+            .clicked()
+        {
+            self.save_repo_path();
+        }
+
+        if let Some(error) = &self.repo_path_form.form_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+
+        if self.repo_paths.is_empty() {
+            ui.weak("No local repos configured yet.");
+        } else {
+            let mut remove_repo = None;
+            for (repo, path) in &self.repo_paths {
+                ui.group(|group| {
+                    group.label(repo);
+                    group.small(path);
+                    if group.small_button("Remove path").clicked() {
+                        remove_repo = Some(repo.clone());
+                    }
+                });
+            }
+            if let Some(repo) = remove_repo {
+                self.remove_repo_path(&repo);
             }
         }
     }
@@ -326,18 +617,14 @@ impl ReminderApp {
             return;
         }
 
-        let Some(selected_login) = self.selected_account_login.as_deref() else {
+        if self.selected_account_login.is_none() {
             ui.centered_and_justified(|center| {
                 center.label("Select an account on the left to view notifications.");
             });
             return;
-        };
+        }
 
-        let Some(selected_idx) = self
-            .accounts
-            .iter()
-            .position(|account| account.profile.login == selected_login)
-        else {
+        let Some(selected_idx) = self.selected_account_index() else {
             ui.centered_and_justified(|center| {
                 center.label("Select an account on the left to view notifications.");
             });
@@ -348,8 +635,9 @@ impl ReminderApp {
             let account = &mut self.accounts[selected_idx];
             account.clear_new_notifications();
             let account_id = account.profile.login.clone();
+            let custom_review_command = custom_review_command_available();
             area.push_id(account_id, |ui| {
-                render_account_card(ui, account);
+                render_account_card(ui, account, &self.repo_paths, custom_review_command);
             });
         });
     }
@@ -360,264 +648,6 @@ impl ReminderApp {
             ui.add_space(8.0);
         }
     }
-}
-
-fn render_account_card(ui: &mut egui::Ui, account: &mut AccountState) {
-    ui.group(|group| {
-        render_account_header(group, account);
-        render_account_status(group, account);
-        render_account_body(group, account);
-    });
-    ui.add_space(12.0);
-}
-
-fn render_account_header(group: &mut egui::Ui, account: &mut AccountState) {
-    if uses_stacked_account_header(group.available_width()) {
-        group.vertical(|column| {
-            column.horizontal_wrapped(|row| {
-                row.heading(format!("Account: {}", account.profile.login));
-                if row
-                    .small_button(if account.expanded {
-                        "Hide notifications"
-                    } else {
-                        "Show notifications"
-                    })
-                    .clicked()
-                {
-                    account.expanded = !account.expanded;
-                }
-            });
-            render_view_mode_toggle(column, account);
-            let search_width = column.available_width();
-            column.add(
-                egui::TextEdit::singleline(&mut account.search_query)
-                    .hint_text("Search…")
-                    .desired_width(search_width),
-            );
-        });
-    } else {
-        group.horizontal(|row| {
-            row.heading(format!("Account: {}", account.profile.login));
-            if row
-                .small_button(if account.expanded {
-                    "Hide notifications"
-                } else {
-                    "Show notifications"
-                })
-                .clicked()
-            {
-                account.expanded = !account.expanded;
-            }
-            row.with_layout(Layout::right_to_left(egui::Align::Center), |lane| {
-                lane.add(
-                    egui::TextEdit::singleline(&mut account.search_query)
-                        .hint_text("Search…")
-                        .desired_width(160.0),
-                );
-                lane.add_space(8.0);
-                render_view_mode_toggle(lane, account);
-            });
-        });
-    }
-}
-
-fn render_view_mode_toggle(ui: &mut egui::Ui, account: &mut AccountState) {
-    ui.selectable_value(&mut account.view_mode, AccountViewMode::Grouped, "Grouped")
-        .on_hover_text("Group notifications into review requests, mentions, and everything else.");
-    ui.selectable_value(
-        &mut account.view_mode,
-        AccountViewMode::Inbox,
-        "Unified inbox",
-    )
-    .on_hover_text("Show every GitHub notification in one list, like GitHub's inbox.");
-}
-
-fn render_account_status(group: &mut egui::Ui, account: &AccountState) {
-    if let Some(inbox) = &account.inbox {
-        group.label(format!(
-            "Last synced {} UTC",
-            inbox.fetched_at.format("%Y-%m-%d %H:%M:%S")
-        ));
-    } else {
-        group.label("No data fetched yet.");
-    }
-
-    if let Some(err) = &account.last_error {
-        group.colored_label(group.visuals().error_fg_color, err);
-    } else if account.pending_job.is_some() {
-        group.label("Fetching latest notifications...");
-    }
-}
-
-fn render_account_body(group: &mut egui::Ui, account: &mut AccountState) {
-    if !account.expanded {
-        if account.inbox.is_none() {
-            group.separator();
-            group.weak("No data loaded yet.");
-        }
-        return;
-    }
-
-    if account.inbox.is_some() {
-        group.separator();
-        let filter = SearchFilter::new(&account.search_query);
-        let actions = match account.view_mode {
-            AccountViewMode::Inbox => render_unified_inbox_section(group, account, &filter),
-            AccountViewMode::Grouped => render_bucket_sections(group, account, &filter),
-        };
-        for action in actions {
-            match action {
-                AccountAction::Done(id) => account.request_mark_done(id),
-                AccountAction::Seen(id) => account.mark_notification_seen(&id),
-                AccountAction::Read(id) => account.request_mark_read(id),
-            }
-        }
-    }
-}
-
-fn render_unified_inbox_section(
-    group: &mut egui::Ui,
-    account: &mut AccountState,
-    filter: &SearchFilter,
-) -> Vec<AccountAction> {
-    let inflight_done = account.inflight_done.clone();
-    let inbox = account.inbox.as_ref().expect("checked by caller");
-    let notifications: Vec<_> = inbox.notifications.iter().collect();
-
-    let (actions, cleared_highlight) = render_notification_section(
-        group,
-        "Inbox",
-        notifications,
-        "You're all caught up 🎉",
-        filter,
-        &inflight_done,
-        account.highlights.contains(&SectionKind::Inbox),
-    );
-    if cleared_highlight {
-        account.highlights.remove(&SectionKind::Inbox);
-    }
-    actions
-}
-
-fn render_bucket_sections(
-    group: &mut egui::Ui,
-    account: &mut AccountState,
-    filter: &SearchFilter,
-) -> Vec<AccountAction> {
-    const REVIEW_REQUEST_REASON: &str = "review_requested";
-    const MENTION_REASONS: &[&str] = &["mention", "team_mention"];
-
-    // Show both seen and unseen items in their contextual buckets; the Done section
-    // is temporarily disabled to avoid splitting the feed.
-    let mut actions = Vec::new();
-    let inflight_done = account.inflight_done.clone();
-    let inbox = account.inbox.as_ref().expect("checked by caller");
-
-    let review_requests: Vec<_> = inbox
-        .notifications
-        .iter()
-        .filter(|item| item.reason == REVIEW_REQUEST_REASON)
-        .collect();
-
-    let (section_actions, cleared_highlight) = render_notification_section(
-        group,
-        "Review requests",
-        review_requests,
-        "No pending review requests.",
-        filter,
-        &inflight_done,
-        account.highlights.contains(&SectionKind::ReviewRequests),
-    );
-    actions.extend(section_actions);
-    if cleared_highlight {
-        account.highlights.remove(&SectionKind::ReviewRequests);
-    }
-    group.separator();
-
-    let mentions: Vec<_> = inbox
-        .notifications
-        .iter()
-        .filter(|item| MENTION_REASONS.contains(&item.reason.as_str()))
-        .collect();
-    let (section_actions, cleared_highlight) = render_notification_section(
-        group,
-        "Mentions",
-        mentions,
-        "No recent mentions.",
-        filter,
-        &inflight_done,
-        account.highlights.contains(&SectionKind::Mentions),
-    );
-    actions.extend(section_actions);
-    if cleared_highlight {
-        account.highlights.remove(&SectionKind::Mentions);
-    }
-    group.separator();
-
-    let other: Vec<_> = inbox
-        .notifications
-        .iter()
-        .filter(|item| {
-            item.reason != REVIEW_REQUEST_REASON && !MENTION_REASONS.contains(&item.reason.as_str())
-        })
-        .collect();
-    let (section_actions, cleared_highlight) = render_notification_section(
-        group,
-        "Notifications",
-        other,
-        "You're all caught up 🎉",
-        filter,
-        &inflight_done,
-        account.highlights.contains(&SectionKind::Notifications),
-    );
-    actions.extend(section_actions);
-    if cleared_highlight {
-        account.highlights.remove(&SectionKind::Notifications);
-    }
-
-    actions
-}
-
-// -----------------------------------------------------------------------------
-// Font configuration
-// -----------------------------------------------------------------------------
-
-fn install_international_fonts(ctx: &Context) {
-    // CJK reviewers reported tofu glyphs because egui's built-in Latin fonts
-    // do not cover Hangul. Prefer system-provided CJK families to avoid bloating
-    // the binary, but fall back to the bundled font when the optional
-    let Some(font_data) = resolve_cjk_font_data() else {
-        eprintln!("Warning: no CJK-capable font found; Some glyphs may fail to render.");
-        return;
-    };
-
-    let mut definitions = FontDefinitions::default();
-    definitions
-        .font_data
-        .insert(CJK_FONT_NAME.to_owned(), font_data.into());
-
-    for family in [FontFamily::Proportional, FontFamily::Monospace] {
-        definitions
-            .families
-            .entry(family)
-            .or_default()
-            .insert(0, CJK_FONT_NAME.to_owned());
-    }
-
-    ctx.set_fonts(definitions);
-}
-
-fn resolve_cjk_font_data() -> Option<FontData> {
-    load_system_cjk_font()
-}
-
-fn load_system_cjk_font() -> Option<FontData> {
-    for candidate in SYSTEM_FONT_CANDIDATES {
-        if let Ok(bytes) = fs::read(candidate) {
-            return Some(FontData::from_owned(bytes));
-        }
-    }
-    None
 }
 
 impl App for ReminderApp {
@@ -636,723 +666,21 @@ impl App for ReminderApp {
             self.render_dashboard(ui);
         });
 
-        ctx.request_repaint_after(Duration::from_millis(500));
-    }
-}
+        self.render_review_settings_window(ctx);
 
-// -----------------------------------------------------------------------------
-// Account state & background jobs
-// -----------------------------------------------------------------------------
-
-struct AccountState {
-    profile: GitHubAccount,
-    inbox: Option<InboxSnapshot>,
-    new_notification_ids: HashSet<String>,
-    last_error: Option<String>,
-    pending_job: Option<PendingJob>,
-    pending_actions: Vec<NotificationActionJob>,
-    expanded: bool,
-    view_mode: AccountViewMode,
-    search_query: String,
-    inflight_done: HashSet<String>,
-    highlights: HashSet<SectionKind>,
-}
-
-impl AccountState {
-    fn new(profile: GitHubAccount) -> Self {
-        Self {
-            profile,
-            inbox: None,
-            new_notification_ids: HashSet::new(),
-            last_error: None,
-            pending_job: None,
-            pending_actions: Vec::new(),
-            expanded: true,
-            view_mode: AccountViewMode::Inbox,
-            search_query: String::new(),
-            inflight_done: HashSet::new(),
-            highlights: HashSet::new(),
-        }
-    }
-
-    fn start_refresh(&mut self) {
-        let profile = self.profile.clone();
-        self.last_error = None;
-        self.pending_job = Some(PendingJob::spawn(profile));
-    }
-
-    fn poll_job(&mut self) {
-        if let Some(job) = &mut self.pending_job
-            && let Some(result) = job.try_take()
-        {
-            self.pending_job = None;
-            match result {
-                Ok(inbox) => {
-                    let new_notification_ids =
-                        collect_new_notification_ids(self.inbox.as_ref(), &inbox);
-                    let current_ids: HashSet<_> = inbox
-                        .notifications
-                        .iter()
-                        .map(|item| item.thread_id.as_str())
-                        .collect();
-                    self.new_notification_ids
-                        .retain(|thread_id| current_ids.contains(thread_id.as_str()));
-                    self.new_notification_ids.extend(new_notification_ids);
-                    let previous_stats = self.inbox.as_ref().map(section_stats);
-                    let next_stats = section_stats(&inbox);
-                    if let Some(old) = previous_stats {
-                        if next_stats.inbox.bumped_since(&old.inbox) {
-                            self.highlights.insert(SectionKind::Inbox);
-                        }
-                        if next_stats
-                            .review_requests
-                            .bumped_since(&old.review_requests)
-                        {
-                            self.highlights.insert(SectionKind::ReviewRequests);
-                        }
-                        if next_stats.mentions.bumped_since(&old.mentions) {
-                            self.highlights.insert(SectionKind::Mentions);
-                        }
-                        if next_stats.notifications.bumped_since(&old.notifications) {
-                            self.highlights.insert(SectionKind::Notifications);
-                        }
-                    }
-
-                    self.inbox = Some(inbox);
-                    self.last_error = None;
-                }
-                Err(err) => {
-                    self.last_error = Some(err.to_string());
-                }
+        for account in &mut self.accounts {
+            for review_output in account.review_outputs.values_mut() {
+                render_review_window(ctx, &account.profile.login, review_output);
             }
         }
-    }
 
-    fn poll_action_jobs(&mut self) {
-        let mut finished = Vec::new();
-        self.pending_actions.retain(|job| match job.try_take() {
-            None => true,
-            Some(result) => {
-                finished.push(result);
-                false
-            }
-        });
-
-        for outcome in finished {
-            match outcome {
-                Ok(thread_id) => self.handle_action_success(&thread_id),
-                Err((thread_id, err)) => {
-                    self.last_error = Some(err);
-                    if let Some(id) = thread_id {
-                        self.inflight_done.remove(&id);
-                    }
-                }
-            }
-        }
-    }
-
-    fn handle_action_success(&mut self, thread_id: &str) {
-        if let Some(inbox) = &mut self.inbox
-            && let Some(item) = inbox
-                .notifications
-                .iter_mut()
-                .find(|item| item.thread_id == thread_id)
-        {
-            item.unread = false;
-            // Consider the thread freshly read at the current timestamp so the
-            // "Updated" badge clears unless new events arrive.
-            item.last_read_at = Some(Utc::now());
-        }
-        self.inflight_done.remove(thread_id);
-    }
-
-    /// Mark a thread as seen the moment the user opens it so the UI reflects
-    /// the visit without waiting for the next GitHub sync cycle.
-    fn mark_notification_seen(&mut self, thread_id: &str) {
-        if let Some(inbox) = &mut self.inbox
-            && let Some(item) = inbox
-                .notifications
-                .iter_mut()
-                .find(|item| item.thread_id == thread_id)
-        {
-            item.unread = false;
-            // Advance the local last_read_at to the newest update to clear the
-            // "Updated" badge unless more activity arrives later.
-            item.last_read_at = Some(item.updated_at);
-        }
-    }
-
-    fn request_mark_read(&mut self, thread_id: String) {
-        if self.inflight_done.contains(&thread_id) {
-            return;
-        }
-        let profile = self.profile.clone();
-        let job = NotificationActionJob::mark_read(profile, thread_id.clone());
-        self.pending_actions.push(job);
-        self.inflight_done.insert(thread_id);
-    }
-
-    fn request_mark_done(&mut self, thread_id: String) {
-        if self.inflight_done.contains(&thread_id) {
-            return;
-        }
-        let profile = self.profile.clone();
-        let job = NotificationActionJob::mark_done(profile, thread_id.clone());
-        self.pending_actions.push(job);
-        self.inflight_done.insert(thread_id);
-    }
-
-    fn needs_refresh(&self, threshold: Duration) -> bool {
-        match &self.inbox {
-            None => true,
-            Some(inbox) => match chrono::Duration::from_std(threshold) {
-                Ok(delta) => (Utc::now() - inbox.fetched_at) >= delta,
-                Err(_) => true,
-            },
-        }
-    }
-
-    fn clear_new_notifications(&mut self) {
-        self.new_notification_ids.clear();
-    }
-}
-
-struct PendingJob {
-    receiver: Receiver<github::FetchOutcome>,
-}
-
-impl PendingJob {
-    fn spawn(profile: GitHubAccount) -> Self {
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let outcome = (|| -> github::FetchOutcome {
-                let client = github::build_client()?;
-                github::fetch_inbox(&client, &profile)
-            })();
-            let _ = tx.send(outcome);
-        });
-        Self { receiver: rx }
-    }
-
-    fn try_take(&self) -> Option<github::FetchOutcome> {
-        match self.receiver.try_recv() {
-            Ok(result) => Some(result),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => Some(Err(FetchError::BackgroundWorkerGone)),
-        }
-    }
-}
-
-type NotificationActionResult = Result<String, (Option<String>, String)>;
-
-struct NotificationActionJob {
-    receiver: Receiver<NotificationActionResult>,
-}
-
-impl NotificationActionJob {
-    fn mark_done(profile: GitHubAccount, thread_id: String) -> Self {
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let outcome = Self::mark_done_worker(profile, thread_id);
-            let _ = tx.send(outcome);
-        });
-        Self { receiver: rx }
-    }
-
-    fn mark_done_worker(profile: GitHubAccount, thread_id: String) -> NotificationActionResult {
-        let client =
-            github::build_client().map_err(|err| (Some(thread_id.clone()), err.to_string()))?;
-        github::mark_notification_done(&client, &profile, &thread_id)
-            .map_err(|err| (Some(thread_id.clone()), err.to_string()))?;
-        Ok(thread_id)
-    }
-
-    fn mark_read(profile: GitHubAccount, thread_id: String) -> Self {
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let outcome = Self::mark_read_worker(profile, thread_id);
-            let _ = tx.send(outcome);
-        });
-        Self { receiver: rx }
-    }
-
-    fn mark_read_worker(profile: GitHubAccount, thread_id: String) -> NotificationActionResult {
-        let client =
-            github::build_client().map_err(|err| (Some(thread_id.clone()), err.to_string()))?;
-        github::mark_notification_read(&client, &profile, &thread_id)
-            .map_err(|err| (Some(thread_id.clone()), err.to_string()))?;
-        Ok(thread_id)
-    }
-
-    fn try_take(&self) -> Option<NotificationActionResult> {
-        match self.receiver.try_recv() {
-            Ok(result) => Some(result),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => Some(Err((
-                None,
-                "Notification action worker disconnected".to_owned(),
-            ))),
-        }
-    }
-}
-
-// -----------------------------------------------------------------------------
-// UI helpers
-// -----------------------------------------------------------------------------
-
-fn render_notification_section(
-    group: &mut egui::Ui,
-    title: &str,
-    subset: Vec<&NotificationItem>,
-    empty_label: &'static str,
-    filter: &SearchFilter,
-    inflight_done: &HashSet<String>,
-    highlight: bool,
-) -> (Vec<AccountAction>, bool) {
-    let (unseen_count, updated_count) = summarize_counts(&subset);
-    let heading = format!(
-        "{title} ({} unseen, {} updated)",
-        unseen_count, updated_count
-    );
-    let heading_text = if highlight {
-        RichText::new(heading.clone())
-            .strong()
-            .color(group.visuals().warn_fg_color)
-    } else {
-        RichText::new(heading.clone()).strong()
-    };
-    let header = egui::CollapsingHeader::new(heading_text)
-        // Keep the collapsing state stable even as counts in the title change.
-        .id_salt(format!("notification-section-{title}"))
-        .default_open(true);
-
-    if subset.is_empty() {
-        let response = header.show(group, |section| {
-            section.weak(empty_label);
-        });
-        return (Vec::new(), response.body_returned.is_some() && highlight);
-    }
-
-    let mut actions = Vec::new();
-    let response = header.show(group, |section| {
-        actions.extend(draw_notifications(section, &subset, filter, inflight_done));
-    });
-    (actions, response.body_returned.is_some() && highlight)
-}
-
-fn summarize_counts(items: &[&NotificationItem]) -> (usize, usize) {
-    let mut unseen = 0;
-    let mut updated = 0;
-    for item in items {
-        let visual = notification_state(item);
-        if item.unread {
-            unseen += 1;
-        }
-        if visual.needs_revisit {
-            updated += 1;
-        }
-    }
-    (unseen, updated)
-}
-
-struct SectionCounts {
-    unseen: usize,
-    updated: usize,
-}
-
-impl SectionCounts {
-    fn new(unseen: usize, updated: usize) -> Self {
-        Self { unseen, updated }
-    }
-
-    fn bumped_since(&self, previous: &SectionCounts) -> bool {
-        self.unseen > previous.unseen || self.updated > previous.updated
-    }
-}
-
-struct SectionStats {
-    inbox: SectionCounts,
-    review_requests: SectionCounts,
-    mentions: SectionCounts,
-    notifications: SectionCounts,
-}
-
-fn section_stats(inbox: &InboxSnapshot) -> SectionStats {
-    const REVIEW_REQUEST_REASON: &str = "review_requested";
-    const MENTION_REASONS: &[&str] = &["mention", "team_mention"];
-
-    let all_notifications: Vec<_> = inbox.notifications.iter().collect();
-    let review_requests: Vec<_> = inbox
-        .notifications
-        .iter()
-        .filter(|item| item.reason == REVIEW_REQUEST_REASON)
-        .collect();
-    let mentions: Vec<_> = inbox
-        .notifications
-        .iter()
-        .filter(|item| MENTION_REASONS.contains(&item.reason.as_str()))
-        .collect();
-    let other: Vec<_> = inbox
-        .notifications
-        .iter()
-        .filter(|item| {
-            item.reason != REVIEW_REQUEST_REASON && !MENTION_REASONS.contains(&item.reason.as_str())
-        })
-        .collect();
-
-    let (inbox_unseen, inbox_updated) = summarize_counts(&all_notifications);
-    let (rr_unseen, rr_updated) = summarize_counts(&review_requests);
-    let (m_unseen, m_updated) = summarize_counts(&mentions);
-    let (o_unseen, o_updated) = summarize_counts(&other);
-
-    SectionStats {
-        inbox: SectionCounts::new(inbox_unseen, inbox_updated),
-        review_requests: SectionCounts::new(rr_unseen, rr_updated),
-        mentions: SectionCounts::new(m_unseen, m_updated),
-        notifications: SectionCounts::new(o_unseen, o_updated),
-    }
-}
-
-// Highlight notifications that churned after the last time we read the thread so
-// they do not silently blend into the "seen" palette. GitHub surfaces
-// `last_read_at` alongside `unread`, but clients may set `unread` to false while a
-// thread continues to evolve.
-#[derive(Clone, Copy)]
-struct NotificationVisualState {
-    seen: bool,
-    needs_revisit: bool,
-}
-
-fn notification_state(item: &NotificationItem) -> NotificationVisualState {
-    let needs_revisit = item
-        .last_read_at
-        .map(|last_read| item.updated_at > last_read)
-        .unwrap_or(false);
-
-    NotificationVisualState {
-        // A thread counts as "seen" only if GitHub marks it read and no updates
-        // landed after that read timestamp.
-        seen: !item.unread && !needs_revisit,
-        needs_revisit,
-    }
-}
-
-fn notification_text(
-    ui: &egui::Ui,
-    text: impl Into<String>,
-    visual: NotificationVisualState,
-) -> RichText {
-    let mut content = RichText::new(text.into());
-    if visual.needs_revisit {
-        content = content.color(ui.visuals().warn_fg_color);
-    } else if visual.seen {
-        content = content.color(ui.visuals().weak_text_color());
-    }
-    content
-}
-
-fn draw_notifications(
-    ui: &mut egui::Ui,
-    items: &[&NotificationItem],
-    filter: &SearchFilter,
-    inflight_done: &HashSet<String>,
-) -> Vec<AccountAction> {
-    let rows: Vec<_> = items
-        .iter()
-        .copied()
-        .filter(|item| filter.matches_any(&[&item.repo, &item.title, &item.reason]))
-        .collect();
-    if rows.is_empty() {
-        ui.weak("No matches for current search.");
-        return Vec::new();
-    }
-
-    if uses_compact_notifications(ui.available_width()) {
-        return draw_notification_cards(ui, &rows, inflight_done);
-    }
-
-    draw_notification_table(ui, &rows, inflight_done)
-}
-
-fn draw_notification_cards(
-    ui: &mut egui::Ui,
-    rows: &[&NotificationItem],
-    inflight_done: &HashSet<String>,
-) -> Vec<AccountAction> {
-    let mut actions = Vec::new();
-
-    for item in rows {
-        let visual = notification_state(item);
-        ui.group(|card| {
-            card.vertical(|column| {
-                column.horizontal_wrapped(|row| {
-                    row.label(notification_text(row, &item.repo, visual));
-                    row.separator();
-                    row.label(notification_text(
-                        row,
-                        item.updated_at.format("%Y-%m-%d %H:%M").to_string(),
-                        visual,
-                    ));
-                    if visual.needs_revisit {
-                        row.small(
-                            RichText::new("Updated")
-                                .strong()
-                                .color(row.visuals().warn_fg_color),
-                        );
-                    }
-                });
-
-                if let Some(url) = &item.url {
-                    let resp =
-                        column.hyperlink_to(notification_text(column, &item.title, visual), url);
-                    if resp.clicked() {
-                        actions.push(AccountAction::Seen(item.thread_id.clone()));
-                    }
-                } else {
-                    let resp = column.label(notification_text(column, &item.title, visual));
-                    if resp.clicked() {
-                        actions.push(AccountAction::Seen(item.thread_id.clone()));
-                    }
-                }
-
-                column.small(notification_text(
-                    column,
-                    format!("Reason: {}", &item.reason),
-                    visual,
-                ));
-
-                column.horizontal_wrapped(|row| {
-                    let busy = inflight_done.contains(&item.thread_id);
-                    let already_read = !item.unread && !visual.needs_revisit;
-
-                    if row
-                        .add_enabled(!busy && !already_read, egui::Button::new("Mark read"))
-                        .clicked()
-                    {
-                        actions.push(AccountAction::Read(item.thread_id.clone()));
-                    }
-
-                    if busy {
-                        row.spinner();
-                    }
-                });
-            });
-        });
-        ui.add_space(8.0);
-    }
-
-    actions
-}
-
-fn draw_notification_table(
-    ui: &mut egui::Ui,
-    rows: &[&NotificationItem],
-    inflight_done: &HashSet<String>,
-) -> Vec<AccountAction> {
-    let mut actions = Vec::new();
-
-    egui::ScrollArea::horizontal()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            TableBuilder::new(ui)
-                .striped(true)
-                .column(Column::initial(120.0).resizable(true))
-                .column(Column::remainder().at_least(140.0))
-                .column(Column::initial(130.0).resizable(true))
-                .column(Column::initial(100.0))
-                .header(20.0, |mut header| {
-                    header.col(|ui| {
-                        ui.strong("Repository");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Subject");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Updated");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Actions");
-                    });
-                })
-                .body(|mut body| {
-                    for item in rows {
-                        let visual = notification_state(item);
-                        body.row(24.0, |mut row| {
-                            row.col(|ui| {
-                                ui.label(notification_text(ui, &item.repo, visual));
-                            });
-                            row.col(|ui| {
-                                ui.horizontal(|row_ui| {
-                                    let subject = notification_text(row_ui, &item.title, visual);
-                                    if let Some(url) = &item.url {
-                                        let resp = row_ui.hyperlink_to(subject, url);
-                                        if resp.clicked() {
-                                            actions
-                                                .push(AccountAction::Seen(item.thread_id.clone()));
-                                        }
-                                    } else {
-                                        let resp = row_ui.label(subject);
-                                        if resp.clicked() {
-                                            actions
-                                                .push(AccountAction::Seen(item.thread_id.clone()));
-                                        }
-                                    }
-                                    if visual.needs_revisit {
-                                        row_ui.small(
-                                            RichText::new("Updated")
-                                                .strong()
-                                                .color(row_ui.visuals().warn_fg_color),
-                                        );
-                                    }
-                                });
-                                ui.small(notification_text(
-                                    ui,
-                                    format!("Reason: {}", &item.reason),
-                                    visual,
-                                ));
-                            });
-                            row.col(|ui| {
-                                ui.label(notification_text(
-                                    ui,
-                                    item.updated_at.format("%Y-%m-%d %H:%M").to_string(),
-                                    visual,
-                                ));
-                            });
-                            row.col(|ui| {
-                                let busy = inflight_done.contains(&item.thread_id);
-                                let already_read = !item.unread && !visual.needs_revisit;
-
-                                if ui
-                                    .add_enabled(
-                                        !busy && !already_read,
-                                        egui::Button::new("Mark read"),
-                                    )
-                                    .clicked()
-                                {
-                                    actions.push(AccountAction::Read(item.thread_id.clone()));
-                                }
-
-                                // Keep layout width consistent even when disabled.
-                                if busy {
-                                    ui.spinner();
-                                }
-                            });
-                        });
-                    }
-                });
-        });
-    actions
-}
-
-fn responsive_accounts_panel_width(window_width: f32) -> f32 {
-    (window_width * ACCOUNTS_PANEL_WIDTH_RATIO)
-        .clamp(ACCOUNTS_PANEL_MIN_WIDTH, ACCOUNTS_PANEL_MAX_WIDTH)
-}
-
-fn tracked_account_heading(
-    ui: &egui::Ui,
-    account: &AccountState,
-    is_selected: bool,
-    overview: Option<AccountOverview>,
-) -> RichText {
-    let has_new = overview
-        .map(|overview| overview.new_notifications > 0)
-        .unwrap_or(false);
-    let mut text = RichText::new(&account.profile.login);
-    if is_selected || has_new {
-        text = text.strong();
-    }
-    if has_new && !is_selected {
-        text = text.color(ui.visuals().warn_fg_color);
-    }
-    text
-}
-
-fn render_tracked_account_badges(
-    ui: &mut egui::Ui,
-    overview: Option<AccountOverview>,
-    pending: bool,
-    has_error: bool,
-) {
-    if let Some(overview) = overview {
-        if overview.new_notifications > 0 {
-            ui.small(
-                RichText::new(format!("new +{}", overview.new_notifications))
-                    .strong()
-                    .color(ui.visuals().warn_fg_color),
-            );
-        }
-        ui.small(format!("unseen {}", overview.unseen));
-        let updated = if overview.updated > 0 {
-            RichText::new(format!("updated {}", overview.updated)).color(ui.visuals().warn_fg_color)
+        let repaint_ms = if self.accounts.iter().any(AccountState::review_in_progress) {
+            ACTIVE_REVIEW_REPAINT_MS
         } else {
-            RichText::new(format!("updated {}", overview.updated))
-                .color(ui.visuals().weak_text_color())
+            500
         };
-        ui.small(updated);
-    } else if pending {
-        ui.small(RichText::new("Loading…").color(ui.visuals().weak_text_color()));
-    } else {
-        ui.small(RichText::new("No data yet").color(ui.visuals().weak_text_color()));
+        ctx.request_repaint_after(Duration::from_millis(repaint_ms));
     }
-
-    if pending {
-        ui.small(RichText::new("syncing…").color(ui.visuals().weak_text_color()));
-    }
-    if has_error {
-        ui.small(RichText::new("sync failed").color(ui.visuals().error_fg_color));
-    }
-}
-
-fn collect_new_notification_ids(
-    previous: Option<&InboxSnapshot>,
-    next: &InboxSnapshot,
-) -> HashSet<String> {
-    let Some(previous) = previous else {
-        return HashSet::new();
-    };
-
-    let known_ids: HashSet<_> = previous
-        .notifications
-        .iter()
-        .map(|item| item.thread_id.as_str())
-        .collect();
-
-    next.notifications
-        .iter()
-        .filter(|item| !known_ids.contains(item.thread_id.as_str()))
-        .map(|item| item.thread_id.clone())
-        .collect()
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct AccountOverview {
-    new_notifications: usize,
-    unseen: usize,
-    updated: usize,
-}
-
-fn account_overview(account: &AccountState) -> Option<AccountOverview> {
-    account.inbox.as_ref().map(|inbox| {
-        let stats = section_stats(inbox);
-        AccountOverview {
-            new_notifications: account.new_notification_ids.len(),
-            unseen: stats.inbox.unseen,
-            updated: stats.inbox.updated,
-        }
-    })
-}
-
-fn uses_compact_account_rows(available_width: f32) -> bool {
-    available_width < COMPACT_ACCOUNT_ROW_WIDTH
-}
-
-fn uses_stacked_account_header(available_width: f32) -> bool {
-    available_width < STACKED_ACCOUNT_HEADER_WIDTH
-}
-
-fn uses_compact_notifications(available_width: f32) -> bool {
-    available_width < COMPACT_NOTIFICATION_WIDTH
 }
 
 // -----------------------------------------------------------------------------
@@ -1362,6 +690,14 @@ fn uses_compact_notifications(available_width: f32) -> bool {
 #[allow(dead_code)]
 enum AccountAction {
     Done(String),
+    Review {
+        thread_id: String,
+        repo: String,
+        pr_number: u64,
+        pr_url: String,
+    },
+    StopReview(String),
+    ToggleReviewWindow(String),
     Seen(String),
     Read(String),
 }
@@ -1387,58 +723,76 @@ struct AccountForm {
     form_error: Option<String>,
 }
 
-struct BatchRefreshScheduler {
-    interval: Duration,
-    last_run: Option<Instant>,
+#[derive(Default)]
+struct RepoPathForm {
+    repo: String,
+    path: String,
+    form_error: Option<String>,
 }
 
-impl BatchRefreshScheduler {
-    fn new(interval: Duration) -> Self {
-        Self {
-            interval,
-            last_run: None,
+struct AccountReviewSettingsEditor {
+    login: String,
+    env_vars_text: String,
+    additional_args_text: String,
+    form_error: Option<String>,
+}
+
+fn format_review_env_vars(settings: &ReviewCommandSettings) -> String {
+    settings
+        .env_vars
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_review_additional_args(settings: &ReviewCommandSettings) -> String {
+    settings.additional_args.join(" ")
+}
+
+fn parse_review_env_vars(text: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut env_vars = BTreeMap::new();
+
+    for (idx, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
         }
-    }
 
-    fn should_trigger(&self) -> bool {
-        match self.last_run {
-            None => true,
-            Some(instant) => instant.elapsed() >= self.interval,
-        }
-    }
-
-    fn mark_triggered(&mut self) {
-        self.last_run = Some(Instant::now());
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Search filtering
-// -----------------------------------------------------------------------------
-
-struct SearchFilter {
-    needle: Option<String>,
-}
-
-impl SearchFilter {
-    fn new(raw: &str) -> Self {
-        let trimmed = raw.trim();
-        let needle = if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_lowercase())
+        let Some((raw_key, raw_value)) = line.split_once('=') else {
+            return Err(format!(
+                "Environment variable line {} must be in KEY=VALUE form.",
+                idx + 1
+            ));
         };
-        Self { needle }
+        let key = raw_key.trim();
+        let value = raw_value.trim();
+        if key.is_empty() {
+            return Err(format!(
+                "Environment variable line {} must include a non-empty key.",
+                idx + 1
+            ));
+        }
+        if key.contains('=') || key.contains('\0') || key.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "Environment variable line {} has an invalid key.",
+                idx + 1
+            ));
+        }
+        if value.contains('\0') {
+            return Err(format!(
+                "Environment variable line {} has an invalid value.",
+                idx + 1
+            ));
+        }
+        env_vars.insert(key.to_owned(), value.to_owned());
     }
 
-    fn matches_any(&self, fields: &[&str]) -> bool {
-        match &self.needle {
-            None => true,
-            Some(needle) => fields
-                .iter()
-                .any(|field| field.to_lowercase().contains(needle)),
-        }
-    }
+    Ok(env_vars)
+}
+
+fn parse_review_additional_args(text: &str) -> Vec<String> {
+    text.split_whitespace().map(str::to_owned).collect()
 }
 
 // -------------------------------------------------------------------------
@@ -1451,6 +805,27 @@ mod tests {
     use chrono::{DateTime, NaiveDateTime, Utc};
     use eframe::egui;
     use eframe::egui::collapsing_header::CollapsingState;
+    use std::{collections::HashSet, time::Instant};
+
+    use crate::domain::{InboxSnapshot, NotificationItem};
+
+    use super::{
+        notification_state::{
+            SectionCounts, base_notification_state, collect_new_notification_ids,
+            pending_review_request_ids, section_stats,
+        },
+        review::{
+            ReviewLaunchPlan, ReviewStatus, append_review_chunk, format_review_failure_output,
+            format_review_success_output, initial_review_output_state, resolve_review_launch,
+            review_summary_text, truncate_review_output,
+        },
+        search::SearchFilter,
+        ui::{
+            NotificationRenderState, notification_state, render_bucket_sections,
+            responsive_accounts_panel_width, uses_compact_account_rows, uses_compact_notifications,
+            uses_stacked_account_header,
+        },
+    };
 
     fn parse_utc(ts: &str) -> DateTime<Utc> {
         NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
@@ -1481,10 +856,46 @@ mod tests {
         }
     }
 
+    fn notif_with_url(
+        thread_id: &str,
+        reason: &str,
+        unread: bool,
+        updated: &str,
+        url: &str,
+    ) -> NotificationItem {
+        NotificationItem {
+            url: Some(url.into()),
+            ..notif(thread_id, reason, unread, updated)
+        }
+    }
+
+    fn review_request(repo: &str, url: &str) -> crate::domain::ReviewRequest {
+        crate::domain::ReviewRequest {
+            _id: 1,
+            repo: repo.into(),
+            title: "#123 Review me".into(),
+            url: url.into(),
+            updated_at: parse_utc("2024-01-01 00:00:00"),
+            requested_by: Some("octocat".into()),
+        }
+    }
+
+    fn review_summary(repo: &str, url: &str) -> crate::domain::ReviewSummary {
+        crate::domain::ReviewSummary {
+            _id: 1,
+            repo: repo.into(),
+            title: "#123 Reviewed".into(),
+            url: url.into(),
+            updated_at: parse_utc("2024-01-01 00:00:00"),
+            state: "open".into(),
+        }
+    }
+
     fn dummy_profile() -> GitHubAccount {
         GitHubAccount {
             login: "user".into(),
             token: "token".into(),
+            review_settings: ReviewCommandSettings::default(),
         }
     }
 
@@ -1492,13 +903,17 @@ mod tests {
         AccountState::new(GitHubAccount {
             login: login.into(),
             token: "token".into(),
+            review_settings: ReviewCommandSettings::default(),
         })
     }
 
     fn app_with_accounts(logins: &[&str]) -> ReminderApp {
         ReminderApp {
             account_form: AccountForm::default(),
+            repo_path_form: RepoPathForm::default(),
+            review_settings_editor: None,
             accounts: logins.iter().map(|login| make_account(login)).collect(),
+            repo_paths: BTreeMap::new(),
             selected_account_login: None,
             secret_store: None,
             storage_warning: None,
@@ -1646,12 +1061,327 @@ mod tests {
     }
 
     #[test]
+    fn resolve_review_launch_prefers_custom_command_for_mapped_repo() {
+        let repo_paths =
+            BTreeMap::from([(String::from("acme/repo"), String::from("/tmp/acme-repo"))]);
+        let review_settings = ReviewCommandSettings {
+            env_vars: BTreeMap::from([(String::from("FOO"), String::from("bar"))]),
+            additional_args: vec![String::from("--lang"), String::from("korean")],
+        };
+
+        let launch = resolve_review_launch(
+            &repo_paths,
+            true,
+            "Acme/Repo",
+            123,
+            &review_settings,
+            "https://github.com/acme/repo/pull/123",
+        );
+
+        assert_eq!(
+            launch,
+            Some(ReviewLaunchPlan::Custom {
+                repo: String::from("Acme/Repo"),
+                repo_path: String::from("/tmp/acme-repo"),
+                pr_number: 123,
+                review_settings,
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_review_launch_returns_none_without_repo_mapping() {
+        let launch = resolve_review_launch(
+            &BTreeMap::new(),
+            true,
+            "acme/repo",
+            123,
+            &ReviewCommandSettings::default(),
+            "https://github.com/acme/repo/pull/123",
+        );
+
+        assert!(launch.is_none());
+    }
+
+    #[test]
+    fn format_review_success_output_prefers_stdout_and_keeps_diagnostics() {
+        let output = format_review_success_output("final review body", "warning details");
+
+        assert!(output.starts_with("final review body"));
+        assert!(output.contains("Diagnostics:\nwarning details"));
+    }
+
+    #[test]
+    fn format_review_success_output_labels_stderr_only_as_diagnostics() {
+        let output = format_review_success_output("", "warning details");
+
+        assert_eq!(output, "Diagnostics:\nwarning details");
+    }
+
+    #[test]
+    fn format_review_failure_output_avoids_repeating_streamed_stdout() {
+        let output = format_review_failure_output("1", "partial stdout", "error stderr");
+
+        assert!(output.contains("stderr:\nerror stderr"));
+        assert!(!output.contains("partial stdout"));
+    }
+
+    #[test]
+    fn truncate_review_output_adds_notice_when_content_is_large() {
+        let text = "a".repeat(MAX_REVIEW_OUTPUT_CHARS + 5);
+
+        let truncated = truncate_review_output(&text);
+
+        assert!(truncated.contains("[truncated 5 trailing characters]"));
+        assert!(truncated.starts_with(&"a".repeat(32)));
+    }
+
+    #[test]
+    fn append_review_chunk_keeps_latest_tail_when_trimming() {
+        let mut review_output = initial_review_output_state(
+            String::from("thread-1"),
+            &ReviewLaunchPlan::Custom {
+                repo: String::from("acme/repo"),
+                repo_path: String::from("/tmp/acme-repo"),
+                pr_number: 123,
+                review_settings: ReviewCommandSettings::default(),
+            },
+        );
+
+        append_review_chunk(&mut review_output, &"a".repeat(MAX_REVIEW_OUTPUT_CHARS));
+        append_review_chunk(&mut review_output, "TAIL");
+
+        assert_eq!(review_output.dropped_chars, 4);
+        assert!(review_output.content.ends_with("TAIL"));
+    }
+
+    #[test]
+    fn initial_review_output_state_tracks_thread_id_for_custom_reviews() {
+        let review_output = initial_review_output_state(
+            String::from("thread-42"),
+            &ReviewLaunchPlan::Custom {
+                repo: String::from("acme/repo"),
+                repo_path: String::from("/tmp/acme-repo"),
+                pr_number: 42,
+                review_settings: ReviewCommandSettings::default(),
+            },
+        );
+
+        assert_eq!(review_output.thread_id, "thread-42");
+        assert_eq!(review_output.command_label, "review-pr");
+        assert_eq!(review_output.status, ReviewStatus::Running);
+    }
+
+    #[test]
+    fn toggle_review_window_for_thread_only_toggles_matching_review() {
+        let mut account = make_account("alpha");
+        account.review_outputs.insert(
+            String::from("thread-1"),
+            initial_review_output_state(
+                String::from("thread-1"),
+                &ReviewLaunchPlan::Custom {
+                    repo: String::from("acme/repo"),
+                    repo_path: String::from("/tmp/acme-repo"),
+                    pr_number: 123,
+                    review_settings: ReviewCommandSettings::default(),
+                },
+            ),
+        );
+
+        account.toggle_review_window_for_thread("thread-2");
+        assert!(
+            account
+                .review_outputs
+                .get("thread-1")
+                .is_some_and(|review_output| review_output.open)
+        );
+
+        account.toggle_review_window_for_thread("thread-1");
+        assert!(
+            account
+                .review_outputs
+                .get("thread-1")
+                .is_some_and(|review_output| !review_output.open)
+        );
+    }
+
+    #[test]
+    fn active_review_thread_ids_returns_only_running_reviews() {
+        let mut account = make_account("alpha");
+        account.review_outputs.insert(
+            String::from("thread-1"),
+            initial_review_output_state(
+                String::from("thread-1"),
+                &ReviewLaunchPlan::Custom {
+                    repo: String::from("acme/repo"),
+                    repo_path: String::from("/tmp/acme-repo"),
+                    pr_number: 123,
+                    review_settings: ReviewCommandSettings::default(),
+                },
+            ),
+        );
+        account.review_outputs.insert(
+            String::from("thread-2"),
+            initial_review_output_state(
+                String::from("thread-2"),
+                &ReviewLaunchPlan::Custom {
+                    repo: String::from("acme/repo"),
+                    repo_path: String::from("/tmp/acme-repo"),
+                    pr_number: 456,
+                    review_settings: ReviewCommandSettings::default(),
+                },
+            ),
+        );
+
+        let active = account.active_review_thread_ids();
+        assert!(active.contains("thread-1"));
+        assert!(active.contains("thread-2"));
+
+        if let Some(review_output) = account.review_outputs.get_mut("thread-2") {
+            review_output.status = ReviewStatus::Cancelled;
+        }
+
+        let active = account.active_review_thread_ids();
+        assert!(active.contains("thread-1"));
+        assert!(!active.contains("thread-2"));
+    }
+
+    #[test]
+    fn review_summary_text_reports_cancelled_status() {
+        let mut review_output = initial_review_output_state(
+            String::from("thread-1"),
+            &ReviewLaunchPlan::Custom {
+                repo: String::from("acme/repo"),
+                repo_path: String::from("/tmp/acme-repo"),
+                pr_number: 123,
+                review_settings: ReviewCommandSettings::default(),
+            },
+        );
+        review_output.status = ReviewStatus::Cancelled;
+
+        let summary = review_summary_text(&review_output);
+
+        assert!(summary.starts_with("Review canceled:"));
+    }
+
+    #[test]
+    fn parse_review_env_vars_parses_key_value_lines() {
+        let env_vars = parse_review_env_vars("FOO=bar\nBAZ=qux").expect("env vars");
+
+        assert_eq!(env_vars.get("FOO"), Some(&String::from("bar")));
+        assert_eq!(env_vars.get("BAZ"), Some(&String::from("qux")));
+    }
+
+    #[test]
+    fn parse_review_additional_args_splits_whitespace_tokens() {
+        let args = parse_review_additional_args("--lang korean --mode fast");
+
+        assert_eq!(args, vec!["--lang", "korean", "--mode", "fast"]);
+    }
+
+    #[test]
     fn notification_state_detects_revisit() {
         let mut item = notif("1", "subscribed", false, "2024-01-02 00:00:00");
         item.last_read_at = Some(parse_utc("2024-01-01 00:00:00"));
-        let visual = notification_state(&item);
+        let visual = base_notification_state(&item);
         assert!(visual.needs_revisit);
         assert!(!visual.seen);
+        assert!(!visual.pending_review);
+    }
+
+    #[test]
+    fn pending_review_request_ids_marks_open_requests_without_my_review() {
+        let pr_url = "https://github.com/acme/repo/pull/123";
+        let inbox = InboxSnapshot {
+            notifications: vec![notif_with_url(
+                "1",
+                "review_requested",
+                true,
+                "2024-01-01 00:00:00",
+                pr_url,
+            )],
+            review_requests: vec![review_request("acme/repo", pr_url)],
+            mentions: Vec::new(),
+            recent_reviews: Vec::new(),
+            fetched_at: Utc::now(),
+        };
+
+        let pending = pending_review_request_ids(&inbox);
+
+        assert!(pending.contains("1"));
+    }
+
+    #[test]
+    fn pending_review_request_ids_highlights_matching_pr_notifications_even_with_other_reason() {
+        let pr_url = "https://github.com/acme/repo/pull/123";
+        let inbox = InboxSnapshot {
+            notifications: vec![notif_with_url(
+                "1",
+                "subscribed",
+                true,
+                "2024-01-01 00:00:00",
+                pr_url,
+            )],
+            review_requests: vec![review_request("acme/repo", pr_url)],
+            mentions: Vec::new(),
+            recent_reviews: Vec::new(),
+            fetched_at: Utc::now(),
+        };
+
+        let pending = pending_review_request_ids(&inbox);
+
+        assert!(pending.contains("1"));
+    }
+
+    #[test]
+    fn pending_review_request_ids_skips_prs_i_already_reviewed() {
+        let pr_url = "https://github.com/acme/repo/pull/123";
+        let inbox = InboxSnapshot {
+            notifications: vec![notif_with_url(
+                "1",
+                "review_requested",
+                true,
+                "2024-01-01 00:00:00",
+                pr_url,
+            )],
+            review_requests: vec![review_request("acme/repo", pr_url)],
+            mentions: Vec::new(),
+            recent_reviews: vec![review_summary("acme/repo", pr_url)],
+            fetched_at: Utc::now(),
+        };
+
+        let pending = pending_review_request_ids(&inbox);
+
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn notification_state_marks_pending_review_requests_from_render_state() {
+        let item = notif_with_url(
+            "1",
+            "review_requested",
+            true,
+            "2024-01-01 00:00:00",
+            "https://github.com/acme/repo/pull/123",
+        );
+        let inflight_done = HashSet::new();
+        let pending_review_ids = [String::from("1")].into_iter().collect();
+        let active_review_thread_ids = HashSet::new();
+        let review_output_thread_ids = HashSet::new();
+        let open_review_window_thread_ids = HashSet::new();
+        let render_state = NotificationRenderState {
+            inflight_done: &inflight_done,
+            pending_review_ids: &pending_review_ids,
+            active_review_thread_ids: &active_review_thread_ids,
+            review_output_thread_ids: &review_output_thread_ids,
+            open_review_window_thread_ids: &open_review_window_thread_ids,
+            custom_review_command: false,
+            repo_paths: &BTreeMap::new(),
+        };
+
+        let visual = notification_state(&item, &render_state);
+
+        assert!(visual.pending_review);
     }
 
     #[test]
@@ -1669,7 +1399,7 @@ mod tests {
 
         ctx.begin_pass(Default::default());
         egui::CentralPanel::default().show(&ctx, |ui| {
-            let _ = render_bucket_sections(ui, &mut account, &filter);
+            let _ = render_bucket_sections(ui, &mut account, &filter, &BTreeMap::new(), false);
         });
         let _ = ctx.end_pass();
 
@@ -1694,7 +1424,7 @@ mod tests {
         // Frame 1: render and manually collapse the notifications section.
         ctx.begin_pass(Default::default());
         egui::CentralPanel::default().show(&ctx, |ui| {
-            let _ = render_bucket_sections(ui, &mut account, &filter);
+            let _ = render_bucket_sections(ui, &mut account, &filter, &BTreeMap::new(), false);
         });
         let id = egui::Id::new("notification-section-Notifications");
         let mut state = CollapsingState::load_with_default_open(&ctx, id, true);
@@ -1706,7 +1436,8 @@ mod tests {
         ctx.begin_pass(Default::default());
         let mut stayed_collapsed = true;
         egui::CentralPanel::default().show(&ctx, |ui| {
-            let response = render_bucket_sections(ui, &mut account, &filter);
+            let response =
+                render_bucket_sections(ui, &mut account, &filter, &BTreeMap::new(), false);
             let state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
             stayed_collapsed = !state.is_open();
             assert!(response.is_empty(), "Rendering should not trigger actions");

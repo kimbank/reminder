@@ -302,6 +302,7 @@ mod tests {
         let profile = GitHubAccount {
             login: "user".into(),
             token: String::new(),
+            review_settings: crate::domain::ReviewCommandSettings::default(),
         };
         let result = mark_notification_read(&client, &profile, "thread123");
         assert!(matches!(result, Err(FetchError::MissingToken)));
