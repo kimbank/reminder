@@ -1,12 +1,13 @@
 use std::{
     collections::BTreeMap,
     env,
-    io::ErrorKind,
-    io::{BufRead, BufReader, Read},
+    fs::OpenOptions,
+    io::{BufReader, ErrorKind, IsTerminal, Read, Write},
+    mem,
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, TryRecvError},
     },
@@ -14,22 +15,69 @@ use std::{
 };
 
 use chrono::Utc;
-use eframe::egui::{self, Context};
+use eframe::egui::{
+    self, Color32, Context, FontId, Stroke,
+    text::{LayoutJob, TextFormat},
+};
+use vt100::Parser as TerminalParser;
 
+#[cfg(test)]
+use super::MAX_REVIEW_OUTPUT_CHARS;
 use super::time::format_local_timestamp;
-use super::{CUSTOM_REVIEW_COMMAND_NAME, MAX_REVIEW_OUTPUT_CHARS, repo_paths::canonical_repo_key};
+use super::{CUSTOM_REVIEW_COMMAND_NAME, repo_paths::canonical_repo_key};
 use crate::domain::ReviewCommandSettings;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+const SHELL_STREAM_DISABLED_NOTE: &str =
+    "[Shell streaming unavailable. This window still renders common ANSI styles inline.]";
+const REVIEW_TEXT_SIZE: f32 = 13.0;
+const REVIEW_TERMINAL_ROWS: u16 = 1000;
+const REVIEW_TERMINAL_COLS: u16 = 240;
+
+static SHELL_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
 pub(super) struct ReviewOutputState {
     pub(super) thread_id: String,
     pub(super) target: String,
     pub(super) command_label: String,
     pub(super) captured_at: Option<chrono::DateTime<Utc>>,
-    pub(super) content: String,
+    terminal: TerminalParser,
+    styled_spans: Vec<ReviewStyledSpan>,
     pub(super) open: bool,
     pub(super) status: ReviewStatus,
     pub(super) dropped_chars: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReviewStyledSpan {
+    text: String,
+    visible_chars: usize,
+    style: ReviewTextStyle,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReviewTextStyle {
+    foreground: Option<Color32>,
+    bold: bool,
+    faint: bool,
+    italic: bool,
+    underline: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ReviewAnsiMode {
+    #[default]
+    Text,
+    Escape,
+    Csi,
+    EscapeString,
+    EscapeStringTerminator,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ReviewAnsiParserState {
+    mode: ReviewAnsiMode,
+    active_style: ReviewTextStyle,
+    csi_buffer: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,7 +91,7 @@ pub(super) enum ReviewStatus {
 pub(super) enum ReviewJobMessage {
     Append {
         thread_id: String,
-        text: String,
+        bytes: Vec<u8>,
     },
     FinishedSuccess {
         thread_id: String,
@@ -52,7 +100,7 @@ pub(super) enum ReviewJobMessage {
     FinishedCancelled {
         thread_id: String,
         captured_at: chrono::DateTime<Utc>,
-        message: String,
+        _message: String,
     },
     FinishedFailure {
         thread_id: String,
@@ -71,6 +119,521 @@ pub(super) struct ReviewJob {
 enum ReviewRunOutcome {
     Completed,
     Cancelled(String),
+}
+
+enum ReviewShellDestination {
+    ControllingTerminal(std::fs::File),
+    Stdout,
+}
+
+struct ReviewShellMirror {
+    destination: ReviewShellDestination,
+    review_label: String,
+}
+
+impl ReviewShellMirror {
+    fn connect(review_label: impl Into<String>) -> Result<Self, String> {
+        let review_label = review_label.into();
+
+        #[cfg(unix)]
+        {
+            if let Ok(terminal) = OpenOptions::new().write(true).open("/dev/tty") {
+                return Ok(Self {
+                    destination: ReviewShellDestination::ControllingTerminal(terminal),
+                    review_label,
+                });
+            }
+        }
+
+        if std::io::stdout().is_terminal() {
+            return Ok(Self {
+                destination: ReviewShellDestination::Stdout,
+                review_label,
+            });
+        }
+
+        Err("No active terminal was available for shell streaming.".to_owned())
+    }
+
+    fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), String> {
+        self.write_raw(chunk)
+    }
+
+    fn write_raw(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let _guard = shell_output_lock()
+            .lock()
+            .map_err(|_| "Review shell output lock poisoned unexpectedly.".to_owned())?;
+
+        match &mut self.destination {
+            ReviewShellDestination::ControllingTerminal(terminal) => {
+                terminal.write_all(bytes).map_err(|err| {
+                    format!("Failed to write review output to the terminal: {err}")
+                })?;
+                terminal
+                    .flush()
+                    .map_err(|err| format!("Failed to flush review output to the terminal: {err}"))
+            }
+            ReviewShellDestination::Stdout => {
+                let mut stdout = std::io::stdout();
+                stdout
+                    .write_all(bytes)
+                    .map_err(|err| format!("Failed to write review output to stdout: {err}"))?;
+                stdout
+                    .flush()
+                    .map_err(|err| format!("Failed to flush review output to stdout: {err}"))
+            }
+        }
+    }
+}
+
+fn shell_output_lock() -> &'static Mutex<()> {
+    SHELL_OUTPUT_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn review_shell_label(launch: &ReviewLaunchPlan) -> String {
+    match launch {
+        ReviewLaunchPlan::Custom {
+            repo, pr_number, ..
+        } => format!("{repo}#{pr_number}"),
+    }
+}
+
+fn review_stream_start_banner(review_label: &str) -> Vec<u8> {
+    format!("\n[reminder] review stream started for {review_label}\n").into_bytes()
+}
+
+fn review_stream_finish_banner(review_label: &str, status: &str) -> Vec<u8> {
+    format!("\n[reminder] review stream {status} for {review_label}\n").into_bytes()
+}
+
+fn send_review_bytes(
+    tx: &mpsc::Sender<ReviewJobMessage>,
+    thread_id: &str,
+    bytes: impl Into<Vec<u8>>,
+) {
+    let _ = tx.send(ReviewJobMessage::Append {
+        thread_id: thread_id.to_owned(),
+        bytes: bytes.into(),
+    });
+}
+
+fn mirror_review_chunk(
+    shell_mirror: &Arc<Mutex<Option<ReviewShellMirror>>>,
+    tx: &mpsc::Sender<ReviewJobMessage>,
+    thread_id: &str,
+    chunk: &[u8],
+) {
+    let Ok(mut shell_mirror_guard) = shell_mirror.lock() else {
+        send_review_bytes(
+            tx,
+            thread_id,
+            b"\n\n[Shell streaming stopped because the shell output lock became unavailable.]\n\n"
+                .to_vec(),
+        );
+        return;
+    };
+    let Some(shell_mirror) = shell_mirror_guard.as_mut() else {
+        return;
+    };
+
+    if let Err(err) = shell_mirror.write_chunk(chunk) {
+        *shell_mirror_guard = None;
+        send_review_bytes(
+            tx,
+            thread_id,
+            format!(
+                "\n\n[Shell streaming stopped: {err}. The window will keep rendering the review inline.]\n\n"
+            )
+            .into_bytes(),
+        );
+    }
+}
+
+fn finish_review_shell_stream(
+    shell_mirror: &Arc<Mutex<Option<ReviewShellMirror>>>,
+    tx: &mpsc::Sender<ReviewJobMessage>,
+    thread_id: &str,
+    status: &str,
+) {
+    let Ok(mut shell_mirror_guard) = shell_mirror.lock() else {
+        return;
+    };
+    let Some(shell_mirror) = shell_mirror_guard.as_mut() else {
+        return;
+    };
+
+    let finish_banner = review_stream_finish_banner(&shell_mirror.review_label, status);
+    if let Err(err) = shell_mirror.write_raw(&finish_banner) {
+        *shell_mirror_guard = None;
+        send_review_bytes(
+            tx,
+            thread_id,
+            format!(
+                "\n\n[Shell streaming stopped while finishing: {err}. The window kept the remaining review output inline.]\n\n"
+            )
+            .into_bytes(),
+        );
+    } else {
+        send_review_bytes(tx, thread_id, finish_banner);
+    }
+}
+
+fn strip_ansi_escape_codes(text: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum AnsiState {
+        Text,
+        Escape,
+        Csi,
+        EscapeString,
+        EscapeStringTerminator,
+    }
+
+    let mut state = AnsiState::Text;
+    let mut cleaned = String::with_capacity(text.len());
+
+    for ch in text.chars() {
+        state = match (state, ch) {
+            (AnsiState::Text, '\u{1b}') => AnsiState::Escape,
+            (AnsiState::Text, _) => {
+                cleaned.push(ch);
+                AnsiState::Text
+            }
+            (AnsiState::Escape, '[') => AnsiState::Csi,
+            (AnsiState::Escape, ']')
+            | (AnsiState::Escape, 'P')
+            | (AnsiState::Escape, '^')
+            | (AnsiState::Escape, '_') => AnsiState::EscapeString,
+            (AnsiState::Escape, _) => AnsiState::Text,
+            (AnsiState::Csi, '@'..='~') => AnsiState::Text,
+            (AnsiState::Csi, _) => AnsiState::Csi,
+            (AnsiState::EscapeString, '\u{7}') => AnsiState::Text,
+            (AnsiState::EscapeString, '\u{1b}') => AnsiState::EscapeStringTerminator,
+            (AnsiState::EscapeString, _) => AnsiState::EscapeString,
+            (AnsiState::EscapeStringTerminator, '\\') => AnsiState::Text,
+            (AnsiState::EscapeStringTerminator, '\u{1b}') => AnsiState::EscapeStringTerminator,
+            (AnsiState::EscapeStringTerminator, _) => AnsiState::EscapeString,
+        };
+    }
+
+    cleaned
+}
+
+fn new_review_terminal() -> TerminalParser {
+    TerminalParser::new(REVIEW_TERMINAL_ROWS, REVIEW_TERMINAL_COLS, 0)
+}
+
+fn append_text_span(spans: &mut Vec<ReviewStyledSpan>, text: String, style: ReviewTextStyle) {
+    if text.is_empty() {
+        return;
+    }
+
+    let visible_chars = text.chars().count();
+    if visible_chars == 0 {
+        return;
+    }
+
+    if let Some(last_span) = spans.last_mut()
+        && last_span.style == style
+    {
+        last_span.text.push_str(&text);
+        last_span.visible_chars += visible_chars;
+    } else {
+        spans.push(ReviewStyledSpan {
+            text,
+            visible_chars,
+            style,
+        });
+    }
+}
+
+fn apply_sgr_code(style: &mut ReviewTextStyle, code: u16) {
+    match code {
+        0 => *style = ReviewTextStyle::default(),
+        1 => style.bold = true,
+        2 => style.faint = true,
+        3 => style.italic = true,
+        4 => style.underline = true,
+        22 => {
+            style.bold = false;
+            style.faint = false;
+        }
+        23 => style.italic = false,
+        24 => style.underline = false,
+        30..=37 => style.foreground = Some(ansi_color_from_4bit(code - 30, false)),
+        39 => style.foreground = None,
+        90..=97 => style.foreground = Some(ansi_color_from_4bit(code - 90, true)),
+        _ => {}
+    }
+}
+
+fn apply_sgr_sequence(style: &mut ReviewTextStyle, sequence: &str) {
+    let sequence = sequence.strip_suffix('m').unwrap_or(sequence);
+    if sequence.is_empty() {
+        *style = ReviewTextStyle::default();
+        return;
+    }
+
+    let codes: Vec<_> = sequence
+        .split(';')
+        .map(|part| {
+            if part.is_empty() {
+                Some(0)
+            } else {
+                part.parse::<u16>().ok()
+            }
+        })
+        .collect();
+    let mut idx = 0;
+
+    while idx < codes.len() {
+        let Some(code) = codes[idx] else {
+            idx += 1;
+            continue;
+        };
+
+        match code {
+            38 => {
+                if let Some((color, consumed)) = ansi_extended_color(&codes[idx + 1..]) {
+                    style.foreground = Some(color);
+                    idx += consumed + 1;
+                } else {
+                    idx += 1;
+                }
+            }
+            39 => {
+                style.foreground = None;
+                idx += 1;
+            }
+            48 => {
+                if let Some((_, consumed)) = ansi_extended_color(&codes[idx + 1..]) {
+                    idx += consumed + 1;
+                } else {
+                    idx += 1;
+                }
+            }
+            _ => {
+                apply_sgr_code(style, code);
+                idx += 1;
+            }
+        }
+    }
+}
+
+fn ansi_extended_color(codes: &[Option<u16>]) -> Option<(Color32, usize)> {
+    match codes {
+        [Some(5), Some(code), ..] => Some((ansi_color_from_8bit(*code), 2)),
+        [Some(2), Some(r), Some(g), Some(b), ..] => {
+            Some((Color32::from_rgb(*r as u8, *g as u8, *b as u8), 4))
+        }
+        _ => None,
+    }
+}
+
+fn ansi_color_from_4bit(code: u16, bright: bool) -> Color32 {
+    match (code, bright) {
+        (0, false) => Color32::from_rgb(28, 28, 28),
+        (1, false) => Color32::from_rgb(205, 49, 49),
+        (2, false) => Color32::from_rgb(13, 188, 121),
+        (3, false) => Color32::from_rgb(229, 229, 16),
+        (4, false) => Color32::from_rgb(36, 114, 200),
+        (5, false) => Color32::from_rgb(188, 63, 188),
+        (6, false) => Color32::from_rgb(17, 168, 205),
+        (7, false) => Color32::from_rgb(229, 229, 229),
+        (0, true) => Color32::from_rgb(102, 102, 102),
+        (1, true) => Color32::from_rgb(241, 76, 76),
+        (2, true) => Color32::from_rgb(35, 209, 139),
+        (3, true) => Color32::from_rgb(245, 245, 67),
+        (4, true) => Color32::from_rgb(59, 142, 234),
+        (5, true) => Color32::from_rgb(214, 112, 214),
+        (6, true) => Color32::from_rgb(41, 184, 219),
+        (7, true) => Color32::from_rgb(255, 255, 255),
+        _ => Color32::LIGHT_GRAY,
+    }
+}
+
+fn ansi_color_from_8bit(code: u16) -> Color32 {
+    if code < 8 {
+        return ansi_color_from_4bit(code, false);
+    }
+    if code < 16 {
+        return ansi_color_from_4bit(code - 8, true);
+    }
+    if (16..=231).contains(&code) {
+        let cube = code - 16;
+        let red = cube / 36;
+        let green = (cube % 36) / 6;
+        let blue = cube % 6;
+        return Color32::from_rgb(
+            ansi_cube_component(red),
+            ansi_cube_component(green),
+            ansi_cube_component(blue),
+        );
+    }
+    if (232..=255).contains(&code) {
+        let value = 8 + ((code - 232) as u8 * 10);
+        return Color32::from_gray(value);
+    }
+
+    Color32::LIGHT_GRAY
+}
+
+fn ansi_cube_component(value: u16) -> u8 {
+    match value {
+        0 => 0,
+        1 => 95,
+        2 => 135,
+        3 => 175,
+        4 => 215,
+        _ => 255,
+    }
+}
+
+fn append_ansi_snapshot(
+    spans: &mut Vec<ReviewStyledSpan>,
+    parser_state: &mut ReviewAnsiParserState,
+    snapshot: &str,
+) {
+    let mut plain_buffer = String::new();
+
+    for ch in snapshot.chars() {
+        match parser_state.mode {
+            ReviewAnsiMode::Text => {
+                if ch == '\u{1b}' {
+                    if !plain_buffer.is_empty() {
+                        let text = mem::take(&mut plain_buffer);
+                        append_text_span(spans, text, parser_state.active_style);
+                    }
+                    parser_state.mode = ReviewAnsiMode::Escape;
+                } else {
+                    plain_buffer.push(ch);
+                }
+            }
+            ReviewAnsiMode::Escape => match ch {
+                '[' => {
+                    parser_state.csi_buffer.clear();
+                    parser_state.mode = ReviewAnsiMode::Csi;
+                }
+                ']' | 'P' | '^' | '_' => {
+                    parser_state.mode = ReviewAnsiMode::EscapeString;
+                }
+                _ => {
+                    parser_state.mode = ReviewAnsiMode::Text;
+                }
+            },
+            ReviewAnsiMode::Csi => {
+                parser_state.csi_buffer.push(ch);
+                if ('@'..='~').contains(&ch) {
+                    if ch == 'm' {
+                        let sequence = mem::take(&mut parser_state.csi_buffer);
+                        apply_sgr_sequence(&mut parser_state.active_style, &sequence);
+                    } else {
+                        parser_state.csi_buffer.clear();
+                    }
+                    parser_state.mode = ReviewAnsiMode::Text;
+                }
+            }
+            ReviewAnsiMode::EscapeString => {
+                if ch == '\u{7}' {
+                    parser_state.mode = ReviewAnsiMode::Text;
+                } else if ch == '\u{1b}' {
+                    parser_state.mode = ReviewAnsiMode::EscapeStringTerminator;
+                }
+            }
+            ReviewAnsiMode::EscapeStringTerminator => match ch {
+                '\\' => parser_state.mode = ReviewAnsiMode::Text,
+                '\u{1b}' => {}
+                _ => parser_state.mode = ReviewAnsiMode::EscapeString,
+            },
+        }
+    }
+
+    if !plain_buffer.is_empty() {
+        append_text_span(spans, plain_buffer, parser_state.active_style);
+    }
+}
+
+fn rebuild_review_output_from_terminal(review_output: &mut ReviewOutputState) {
+    let screen = review_output.terminal.screen();
+    let (rows, cols) = screen.size();
+    let plain_rows: Vec<_> = screen.rows(0, cols).collect();
+    let formatted_rows: Vec<_> = screen.rows_formatted(0, cols).collect();
+    let cursor_row = usize::from(screen.cursor_position().0);
+    let last_non_empty_row = plain_rows
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, row)| !row.is_empty())
+        .map(|(idx, _)| idx);
+
+    review_output.styled_spans.clear();
+    review_output.dropped_chars = 0;
+
+    let Some(last_row) =
+        last_non_empty_row.map_or(Some(cursor_row), |idx| Some(idx.max(cursor_row)))
+    else {
+        return;
+    };
+
+    let mut parser_state = ReviewAnsiParserState::default();
+    for row_idx in 0..=last_row.min(usize::from(rows.saturating_sub(1))) {
+        let formatted_row = String::from_utf8_lossy(&formatted_rows[row_idx]);
+        append_ansi_snapshot(
+            &mut review_output.styled_spans,
+            &mut parser_state,
+            formatted_row.as_ref(),
+        );
+
+        if row_idx < last_row && !screen.row_wrapped(row_idx as u16) {
+            append_text_span(
+                &mut review_output.styled_spans,
+                "\n".to_owned(),
+                ReviewTextStyle::default(),
+            );
+        }
+    }
+}
+
+fn review_text_format(ui: &egui::Ui, style: ReviewTextStyle) -> TextFormat {
+    let mut color = style
+        .foreground
+        .unwrap_or_else(|| ui.visuals().text_color());
+    if style.faint {
+        color = color.gamma_multiply(0.7);
+    }
+    if style.bold {
+        color = color.gamma_multiply(1.15);
+    }
+
+    TextFormat {
+        font_id: FontId::monospace(REVIEW_TEXT_SIZE),
+        color,
+        italics: style.italic,
+        underline: if style.underline {
+            Stroke::new(1.0, color)
+        } else {
+            Stroke::NONE
+        },
+        ..Default::default()
+    }
+}
+
+fn review_output_layout_job(review_output: &ReviewOutputState, ui: &egui::Ui) -> LayoutJob {
+    let mut job = LayoutJob::default();
+
+    for span in &review_output.styled_spans {
+        job.append(&span.text, 0.0, review_text_format(ui, span.style));
+    }
+
+    job
+}
+
+#[cfg(test)]
+pub(super) fn review_output_plain_text(review_output: &ReviewOutputState) -> String {
+    review_output
+        .styled_spans
+        .iter()
+        .map(|span| span.text.as_str())
+        .collect()
 }
 
 impl ReviewJob {
@@ -97,7 +660,7 @@ impl ReviewJob {
                 Ok(ReviewRunOutcome::Cancelled(message)) => ReviewJobMessage::FinishedCancelled {
                     thread_id: worker_thread_id.clone(),
                     captured_at: Utc::now(),
-                    message,
+                    _message: message,
                 },
                 Err(message) => ReviewJobMessage::FinishedFailure {
                     thread_id: worker_thread_id,
@@ -204,6 +767,8 @@ fn run_review_stream(
     child_handle: Arc<Mutex<Option<Child>>>,
     cancel_requested: Arc<AtomicBool>,
 ) -> Result<ReviewRunOutcome, String> {
+    let review_label = review_shell_label(launch);
+
     match launch {
         ReviewLaunchPlan::Custom {
             repo_path,
@@ -216,6 +781,7 @@ fn run_review_stream(
             repo_path,
             *pr_number,
             review_settings,
+            &review_label,
             child_handle,
             cancel_requested,
         ),
@@ -228,6 +794,7 @@ fn run_custom_review(
     repo_path: &str,
     pr_number: u64,
     review_settings: &ReviewCommandSettings,
+    review_label: &str,
     child_handle: Arc<Mutex<Option<Child>>>,
     cancel_requested: Arc<AtomicBool>,
 ) -> Result<ReviewRunOutcome, String> {
@@ -245,27 +812,92 @@ fn run_custom_review(
     command.arg("--");
     command.args(&review_settings.additional_args);
     println!("Running custom review command: {:?}", command);
-    stream_review_command(tx, thread_id, command, child_handle, cancel_requested)
+    stream_review_command(
+        tx,
+        thread_id,
+        review_label,
+        command,
+        child_handle,
+        cancel_requested,
+    )
+}
+
+fn read_review_stream(
+    tx: &mpsc::Sender<ReviewJobMessage>,
+    thread_id: &str,
+    reader: impl Read,
+    shell_mirror: &Arc<Mutex<Option<ReviewShellMirror>>>,
+    cancel_requested: &Arc<AtomicBool>,
+    stream_label: &str,
+) -> Result<String, String> {
+    let mut capture = String::new();
+    let mut reader = BufReader::new(reader);
+    let mut buffer = [0_u8; 4096];
+
+    loop {
+        let bytes = match reader.read(&mut buffer) {
+            Ok(bytes) => bytes,
+            Err(err) if cancel_requested.load(Ordering::SeqCst) => break,
+            Err(err) => return Err(format!("Failed to read {stream_label}: {err}")),
+        };
+
+        if bytes == 0 {
+            break;
+        }
+
+        let chunk = &buffer[..bytes];
+        mirror_review_chunk(shell_mirror, tx, thread_id, chunk);
+        send_review_bytes(tx, thread_id, chunk.to_vec());
+        capture.push_str(&strip_ansi_escape_codes(&String::from_utf8_lossy(chunk)));
+    }
+
+    Ok(capture)
 }
 
 fn stream_review_command(
     tx: &mpsc::Sender<ReviewJobMessage>,
     thread_id: &str,
+    review_label: &str,
     mut command: Command,
     child_handle: Arc<Mutex<Option<Child>>>,
     cancel_requested: Arc<AtomicBool>,
 ) -> Result<ReviewRunOutcome, String> {
     let mut child = command
         .spawn()
-        .map_err(|err| format!("Failed to start opencode review: {err}"))?;
+        .map_err(|err| format!("Failed to start review: {err}"))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "Failed to capture opencode stdout.".to_owned())?;
+        .ok_or_else(|| "Failed to capture stdout.".to_owned())?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| "Failed to capture opencode stderr.".to_owned())?;
+        .ok_or_else(|| "Failed to capture stderr.".to_owned())?;
+
+    let shell_mirror = match ReviewShellMirror::connect(review_label.to_owned()) {
+        Ok(mut shell_mirror) => {
+            let start_banner = review_stream_start_banner(review_label);
+            if let Err(err) = shell_mirror.write_raw(&start_banner) {
+                send_review_bytes(
+                    tx,
+                    thread_id,
+                    format!("{SHELL_STREAM_DISABLED_NOTE} {err}\n\n").into_bytes(),
+                );
+                Arc::new(Mutex::new(None))
+            } else {
+                send_review_bytes(tx, thread_id, start_banner);
+                Arc::new(Mutex::new(Some(shell_mirror)))
+            }
+        }
+        Err(err) => {
+            send_review_bytes(
+                tx,
+                thread_id,
+                format!("{SHELL_STREAM_DISABLED_NOTE} {err}\n\n").into_bytes(),
+            );
+            Arc::new(Mutex::new(None))
+        }
+    };
 
     {
         let mut shared_child = child_handle
@@ -293,42 +925,28 @@ fn stream_review_command(
     }
 
     let stderr_cancel_requested = Arc::clone(&cancel_requested);
+    let stderr_shell_mirror = Arc::clone(&shell_mirror);
+    let stderr_tx = tx.clone();
+    let stderr_thread_id = thread_id.to_owned();
     let stderr_handle = thread::spawn(move || -> Result<String, String> {
-        let mut diagnostics = String::new();
-        let mut reader = BufReader::new(stderr);
-        match reader.read_to_string(&mut diagnostics) {
-            Ok(_) => {}
-            Err(err) if stderr_cancel_requested.load(Ordering::SeqCst) => {}
-            Err(err) => return Err(format!("Failed to read opencode diagnostics: {err}")),
-        }
-        Ok(diagnostics)
+        read_review_stream(
+            &stderr_tx,
+            &stderr_thread_id,
+            stderr,
+            &stderr_shell_mirror,
+            &stderr_cancel_requested,
+            "diagnostics",
+        )
     });
 
-    let mut stdout_capture = String::new();
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let bytes = match reader.read_line(&mut line) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                if cancel_requested.load(Ordering::SeqCst) {
-                    return Ok(ReviewRunOutcome::Cancelled(
-                        "Review canceled by user.".to_owned(),
-                    ));
-                }
-                return Err(format!("Failed to read opencode output: {err}"));
-            }
-        };
-        if bytes == 0 {
-            break;
-        }
-        stdout_capture.push_str(&line);
-        let _ = tx.send(ReviewJobMessage::Append {
-            thread_id: thread_id.to_owned(),
-            text: line.clone(),
-        });
-    }
+    let stdout_capture = read_review_stream(
+        tx,
+        thread_id,
+        stdout,
+        &shell_mirror,
+        &cancel_requested,
+        "output",
+    )?;
 
     let status = {
         let mut shared_child = child_handle
@@ -344,7 +962,7 @@ fn stream_review_command(
                     "Review canceled by user.".to_owned(),
                 ));
             }
-            Err(err) => return Err(format!("Failed while waiting for opencode review: {err}")),
+            Err(err) => return Err(format!("Failed while waiting for review: {err}")),
         }
     };
     let stderr_capture = match stderr_handle.join() {
@@ -366,33 +984,18 @@ fn stream_review_command(
     };
 
     if cancel_requested.load(Ordering::SeqCst) && !status.success() {
+        finish_review_shell_stream(&shell_mirror, tx, thread_id, "cancelled");
         return Ok(ReviewRunOutcome::Cancelled(
             "Review canceled by user.".to_owned(),
         ));
     }
 
     if status.success() {
-        if stdout_capture.trim().is_empty() && stderr_capture.trim().is_empty() {
-            let _ = tx.send(ReviewJobMessage::Append {
-                thread_id: thread_id.to_owned(),
-                text: "opencode review completed with no output.".to_owned(),
-            });
-            return Ok(ReviewRunOutcome::Completed);
-        }
-        let diagnostics = format_review_success_output("", &stderr_capture);
-        if diagnostics != "opencode review completed with no output." && !diagnostics.is_empty() {
-            let prefix = if stdout_capture.trim().is_empty() {
-                ""
-            } else {
-                "\n\n"
-            };
-            let _ = tx.send(ReviewJobMessage::Append {
-                thread_id: thread_id.to_owned(),
-                text: format!("{prefix}{diagnostics}"),
-            });
-        }
+        finish_review_shell_stream(&shell_mirror, tx, thread_id, "completed");
         return Ok(ReviewRunOutcome::Completed);
     }
+
+    finish_review_shell_stream(&shell_mirror, tx, thread_id, "failed");
 
     Err(format_review_failure_output(
         &status.to_string(),
@@ -401,6 +1004,7 @@ fn stream_review_command(
     ))
 }
 
+#[cfg(test)]
 pub(super) fn format_review_success_output(stdout: &str, stderr: &str) -> String {
     let stdout = stdout.trim();
     let stderr = stderr.trim();
@@ -451,7 +1055,8 @@ pub(super) fn initial_review_output_state(
             target: format!("{repo}#{pr_number}"),
             command_label: String::from(CUSTOM_REVIEW_COMMAND_NAME),
             captured_at: None,
-            content: String::new(),
+            terminal: new_review_terminal(),
+            styled_spans: Vec::new(),
             open: true,
             status: ReviewStatus::Running,
             dropped_chars: 0,
@@ -459,16 +1064,9 @@ pub(super) fn initial_review_output_state(
     }
 }
 
-pub(super) fn append_review_chunk(review_output: &mut ReviewOutputState, chunk: &str) {
-    review_output.content.push_str(chunk);
-    let current_chars = review_output.content.chars().count();
-    if current_chars <= MAX_REVIEW_OUTPUT_CHARS {
-        return;
-    }
-
-    let overflow = current_chars - MAX_REVIEW_OUTPUT_CHARS;
-    review_output.content = review_output.content.chars().skip(overflow).collect();
-    review_output.dropped_chars += overflow;
+pub(super) fn append_review_chunk(review_output: &mut ReviewOutputState, chunk: impl AsRef<[u8]>) {
+    review_output.terminal.process(chunk.as_ref());
+    rebuild_review_output_from_terminal(review_output);
 }
 
 pub(super) fn review_summary_text(review_output: &ReviewOutputState) -> String {
@@ -509,14 +1107,6 @@ pub(super) fn render_review_window(
         ReviewStatus::Failed => format!("Review failed: {}", review_output.target),
     };
     let mut open = review_output.open;
-    let mut content = if review_output.dropped_chars > 0 {
-        format!(
-            "[trimmed {} leading characters]\n\n{}",
-            review_output.dropped_chars, review_output.content
-        )
-    } else {
-        review_output.content.clone()
-    };
     let status_line = review_summary_text(review_output);
 
     egui::Window::new(title)
@@ -531,15 +1121,18 @@ pub(super) fn render_review_window(
         .default_size(egui::vec2(720.0, 420.0))
         .show(ctx, |ui| {
             ui.small(status_line);
-            egui::ScrollArea::vertical()
+            if review_output.dropped_chars > 0 {
+                ui.small(format!(
+                    "[trimmed {} leading characters]",
+                    review_output.dropped_chars
+                ));
+            }
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
                 .stick_to_bottom(review_output.status == ReviewStatus::Running)
                 .show(ui, |scroll| {
-                    scroll.add(
-                        egui::TextEdit::multiline(&mut content)
-                            .desired_rows(20)
-                            .desired_width(f32::INFINITY)
-                            .interactive(false),
-                    );
+                    let content_job = review_output_layout_job(review_output, scroll);
+                    scroll.add(egui::Label::new(content_job).extend().selectable(true));
                 });
         });
 
@@ -594,4 +1187,115 @@ fn custom_review_command_path() -> Option<PathBuf> {
     env::var("HOME")
         .ok()
         .map(|home| PathBuf::from(home).join(".config/opencode/commands/review-pr.md"))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::domain::ReviewCommandSettings;
+
+    use super::{
+        ReviewLaunchPlan, ansi_color_from_4bit, append_review_chunk, initial_review_output_state,
+        review_output_plain_text, strip_ansi_escape_codes,
+    };
+
+    fn review_state() -> super::ReviewOutputState {
+        initial_review_output_state(
+            String::from("thread-1"),
+            &ReviewLaunchPlan::Custom {
+                repo: String::from("acme/repo"),
+                repo_path: String::from("/tmp/acme-repo"),
+                pr_number: 123,
+                review_settings: ReviewCommandSettings::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn strip_ansi_escape_codes_removes_color_sequences() {
+        let raw = "\u{1b}[32mreview ready\u{1b}[0m\n";
+
+        assert_eq!(strip_ansi_escape_codes(raw), "review ready\n");
+    }
+
+    #[test]
+    fn strip_ansi_escape_codes_removes_osc_hyperlinks() {
+        let raw = "\u{1b}]8;;https://example.com\u{7}open pr\u{1b}]8;;\u{7}";
+
+        assert_eq!(strip_ansi_escape_codes(raw), "open pr");
+    }
+
+    #[test]
+    fn append_review_chunk_preserves_basic_ansi_styles_for_egui() {
+        let mut review_output = review_state();
+
+        append_review_chunk(&mut review_output, "\u{1b}[31mred\u{1b}[0m normal");
+
+        assert_eq!(review_output_plain_text(&review_output), "red normal");
+        assert_eq!(review_output.styled_spans.len(), 2);
+        assert_eq!(
+            review_output.styled_spans[0].style.foreground,
+            Some(ansi_color_from_4bit(1, false))
+        );
+        assert_eq!(review_output.styled_spans[1].style.foreground, None);
+    }
+
+    #[test]
+    fn append_review_chunk_handles_split_escape_sequences() {
+        let mut review_output = review_state();
+
+        append_review_chunk(&mut review_output, "\u{1b}[31");
+        append_review_chunk(&mut review_output, "mred");
+
+        assert_eq!(review_output_plain_text(&review_output), "red");
+        assert_eq!(
+            review_output.styled_spans[0].style.foreground,
+            Some(ansi_color_from_4bit(1, false))
+        );
+    }
+
+    #[test]
+    fn append_review_chunk_overwrites_from_line_start_on_carriage_return() {
+        let mut review_output = review_state();
+
+        append_review_chunk(&mut review_output, "[Pasted ~2 lines]\rnext line");
+
+        assert_eq!(
+            review_output_plain_text(&review_output),
+            "next line2 lines]"
+        );
+    }
+
+    #[test]
+    fn append_review_chunk_preserves_crlf_newlines() {
+        let mut review_output = review_state();
+
+        append_review_chunk(&mut review_output, "first line\r\nsecond line");
+
+        assert_eq!(
+            review_output_plain_text(&review_output),
+            "first line\nsecond line"
+        );
+    }
+
+    #[test]
+    fn append_review_chunk_handles_split_carriage_return_rewrites() {
+        let mut review_output = review_state();
+
+        append_review_chunk(&mut review_output, "[Pasted ~2 lines]\r");
+        append_review_chunk(&mut review_output, "next line");
+
+        assert_eq!(
+            review_output_plain_text(&review_output),
+            "next line2 lines]"
+        );
+    }
+
+    #[test]
+    fn append_review_chunk_handles_clear_line_rewrite_sequences() {
+        let mut review_output = review_state();
+
+        append_review_chunk(&mut review_output, "temporary status\r\u{1b}[2Kreal output");
+
+        assert_eq!(review_output_plain_text(&review_output), "real output");
+    }
 }

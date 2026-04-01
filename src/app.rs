@@ -42,6 +42,7 @@ const COMPACT_ACCOUNT_ROW_WIDTH: f32 = 180.0;
 const STACKED_ACCOUNT_HEADER_WIDTH: f32 = 620.0;
 const COMPACT_NOTIFICATION_WIDTH: f32 = 640.0;
 const CUSTOM_REVIEW_COMMAND_NAME: &str = "review-pr";
+#[cfg(test)]
 const MAX_REVIEW_OUTPUT_CHARS: usize = 20_000;
 const ACTIVE_REVIEW_REPAINT_MS: u64 = 50;
 const REVIEW_REQUEST_REASON: &str = "review_requested";
@@ -912,7 +913,7 @@ mod tests {
         review::{
             ReviewLaunchPlan, ReviewStatus, append_review_chunk, format_review_failure_output,
             format_review_success_output, initial_review_output_state, resolve_review_launch,
-            review_summary_text, truncate_review_output,
+            review_output_plain_text, review_summary_text, truncate_review_output,
         },
         search::SearchFilter,
         ui::{
@@ -1259,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn append_review_chunk_keeps_latest_tail_when_trimming() {
+    fn append_review_chunk_keeps_latest_tail_visible() {
         let mut review_output = initial_review_output_state(
             String::from("thread-1"),
             &ReviewLaunchPlan::Custom {
@@ -1273,8 +1274,8 @@ mod tests {
         append_review_chunk(&mut review_output, &"a".repeat(MAX_REVIEW_OUTPUT_CHARS));
         append_review_chunk(&mut review_output, "TAIL");
 
-        assert_eq!(review_output.dropped_chars, 4);
-        assert!(review_output.content.ends_with("TAIL"));
+        assert_eq!(review_output.dropped_chars, 0);
+        assert!(review_output_plain_text(&review_output).ends_with("TAIL"));
     }
 
     #[test]

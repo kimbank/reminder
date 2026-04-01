@@ -122,9 +122,9 @@ impl AccountState {
 
         for message in messages {
             match message {
-                ReviewJobMessage::Append { thread_id, text } => {
+                ReviewJobMessage::Append { thread_id, bytes } => {
                     if let Some(review_output) = self.review_outputs.get_mut(&thread_id) {
-                        append_review_chunk(review_output, &text);
+                        append_review_chunk(review_output, &bytes);
                     }
                 }
                 ReviewJobMessage::FinishedSuccess {
@@ -140,12 +140,11 @@ impl AccountState {
                 ReviewJobMessage::FinishedCancelled {
                     thread_id,
                     captured_at,
-                    message,
+                    _message: _,
                 } => {
                     if let Some(review_output) = self.review_outputs.get_mut(&thread_id) {
                         review_output.status = ReviewStatus::Cancelled;
                         review_output.captured_at = Some(captured_at);
-                        append_review_chunk(review_output, &format!("\n\n{message}"));
                     }
                     self.inflight_done.remove(&thread_id);
                 }
@@ -158,10 +157,6 @@ impl AccountState {
                     if let Some(review_output) = self.review_outputs.get_mut(&thread_id) {
                         review_output.status = ReviewStatus::Failed;
                         review_output.captured_at = Some(captured_at);
-                        append_review_chunk(
-                            review_output,
-                            &format!("\n\nReview failed:\n{message}"),
-                        );
                     }
                     self.inflight_done.remove(&thread_id);
                 }
