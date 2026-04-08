@@ -254,7 +254,7 @@ fn draw_notifications(
     let rows: Vec<_> = items
         .iter()
         .copied()
-        .filter(|item| filter.matches_any(&[&item.repo, &item.title, &item.reason]))
+        .filter(|item| notification_matches_search(item, filter))
         .collect();
     if rows.is_empty() {
         ui.weak("No matches for current search.");
@@ -266,6 +266,35 @@ fn draw_notifications(
     }
 
     draw_notification_table(ui, &rows, render_state)
+}
+
+fn notification_matches_search(item: &NotificationItem, filter: &SearchFilter) -> bool {
+    let display_title = item.display_title();
+    let number_alias = item.thread_number().map(|number| number.to_string());
+    let hash_alias = item.thread_number().map(|number| format!("#{number}"));
+    let repo_number_alias = item
+        .thread_number()
+        .map(|number| format!("{}#{number}", item.repo));
+
+    let mut fields = vec![
+        item.repo.as_str(),
+        display_title.as_str(),
+        item.reason.as_str(),
+    ];
+    if let Some(url) = item.url.as_deref() {
+        fields.push(url);
+    }
+    if let Some(alias) = number_alias.as_deref() {
+        fields.push(alias);
+    }
+    if let Some(alias) = hash_alias.as_deref() {
+        fields.push(alias);
+    }
+    if let Some(alias) = repo_number_alias.as_deref() {
+        fields.push(alias);
+    }
+
+    filter.matches_any(&fields)
 }
 
 fn draw_notification_cards(
@@ -565,4 +594,64 @@ fn draw_notification_table(
                 });
         });
     actions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::notification_matches_search;
+    use crate::{app::search::SearchFilter, domain::NotificationItem};
+    use chrono::Utc;
+
+    fn notification_with_url(url: &str) -> NotificationItem {
+        NotificationItem {
+            thread_id: String::from("thread-1"),
+            repo: String::from("acme/repo"),
+            title: String::from("Fix search behavior"),
+            url: Some(url.to_owned()),
+            reason: String::from("review_requested"),
+            updated_at: Utc::now(),
+            last_read_at: None,
+            unread: true,
+        }
+    }
+
+    #[test]
+    fn notification_search_matches_pull_request_number_without_hash() {
+        let item = notification_with_url("https://github.com/acme/repo/pull/123");
+
+        assert!(notification_matches_search(
+            &item,
+            &SearchFilter::new("123")
+        ));
+    }
+
+    #[test]
+    fn notification_search_matches_pull_request_number_with_hash() {
+        let item = notification_with_url("https://github.com/acme/repo/pull/123");
+
+        assert!(notification_matches_search(
+            &item,
+            &SearchFilter::new("#123")
+        ));
+    }
+
+    #[test]
+    fn notification_search_ignores_unrelated_pull_request_number() {
+        let item = notification_with_url("https://github.com/acme/repo/pull/123");
+
+        assert!(!notification_matches_search(
+            &item,
+            &SearchFilter::new("456")
+        ));
+    }
+
+    #[test]
+    fn notification_search_matches_repo_scoped_pull_request_number() {
+        let item = notification_with_url("https://github.com/acme/repo/pull/123");
+
+        assert!(notification_matches_search(
+            &item,
+            &SearchFilter::new("acme/repo#123")
+        ));
+    }
 }
